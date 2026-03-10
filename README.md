@@ -1,15 +1,15 @@
 # 🐝 swarm-cli
 
-Multi-Agent Deliberation CLI — runs coding tasks across multiple AI CLI agents in parallel, then synthesizes conflicts for human decision.
+Multi-Agent Deliberation CLI — runs coding tasks across multiple AI agents in parallel using their SDKs with tool calling, then synthesizes conflicts for human decision.
 
 ## What It Does
 
-`swarm` spawns multiple AI coding agents (Claude, Codex, Gemini) in isolated git worktrees, lets them work on the same task independently, then uses any model to analyze and synthesize the results — identifying conflicts, comparing approaches, and providing recommendations.
+`swarm` runs multiple AI coding agents (Claude, OpenAI, Gemini) in isolated git worktrees using their native SDKs with tool calling. Each agent works on the same task independently, then a synthesizer analyzes the results — identifying conflicts, comparing approaches, and providing recommendations.
 
 ```
 ┌─────────────┐   ┌─────────────┐   ┌─────────────┐
-│   Claude    │   │   Gemini    │   │   Codex     │
-│  (worktree) │   │  (worktree) │   │  (worktree) │
+│   Claude    │   │   Gemini    │   │   OpenAI    │
+│  (SDK+Tools)│   │  (SDK+Tools)│   │  (SDK+Tools)│
 └──────┬──────┘   └──────┬──────┘   └──────┬──────┘
        │                 │                 │
        └────────────┬────┴────────────────┘
@@ -48,23 +48,20 @@ npm install -g swarm-cli
 - Git must be installed and available in PATH
 - Must be run inside a git repository
 
-### AI CLI Agents (at least one required)
+### API Keys (at least one required)
 
-| Agent | Installation | Notes |
-|-------|--------------|-------|
-| **Claude** | `npm install -g @anthropic-ai/claude-code` | Claude Code CLI |
-| **Codex** | `npm install -g @openai/codex` | OpenAI Codex CLI |
-| **Gemini** | `npm install -g @google/gemini-cli` | Google Gemini CLI |
-
-### API Keys (optional)
-
-For API auth mode (instead of CLI subscriptions):
+swarm-cli uses native SDKs with tool calling. Set at least one API key:
 
 ```bash
-export ANTHROPIC_API_KEY="sk-..."   # For Claude API
-export OPENAI_API_KEY="sk-..."      # For OpenAI/Codex API
-export GEMINI_API_KEY="..."         # For Gemini API
+export ANTHROPIC_API_KEY="sk-..."   # For Claude
+export OPENAI_API_KEY="sk-..."      # For OpenAI
+export GEMINI_API_KEY="..."         # For Gemini
 ```
+
+**Or use subscription credentials:**
+- Claude: automatically reads OAuth tokens from `~/.claude/.credentials.json` or macOS Keychain
+- Codex: automatically reads OAuth tokens from `~/.codex/auth.json` or macOS Keychain
+- Gemini: automatically reads OAuth tokens from `~/.config/gemini/credentials.json`
 
 ## Quick Start
 
@@ -79,6 +76,22 @@ swarm --list-models
 swarm "add input validation to user forms"
 ```
 
+## Agent Capabilities
+
+Each agent has access to these tools:
+
+| Tool | Description |
+|------|-------------|
+| `read_file` | Read file contents |
+| `write_file` | Create or overwrite files |
+| `list_directory` | List files and directories |
+| `execute_command` | Run shell commands |
+| `search_files` | Find files by glob pattern |
+| `grep` | Search for patterns in files |
+| `task_complete` | Signal task completion |
+
+Agents can explore the codebase, make changes, run tests, and verify their work — all through native SDK tool calling.
+
 ## Usage Examples
 
 ### Basic Usage
@@ -91,7 +104,7 @@ swarm "add unit tests for the auth module"
 swarm "refactor database queries" --agents claude:opus,gemini:pro
 
 # Use different synthesizer
-swarm "fix memory leak" --agents claude:sonnet,codex --synthesizer claude:opus
+swarm "fix memory leak" --agents claude:sonnet,openai --synthesizer claude:opus
 ```
 
 ### Output Options
@@ -199,7 +212,7 @@ Models are specified as `provider:variant`:
 | `claude` | `opus`, `sonnet`, `haiku` | `sonnet` | `claude:opus` |
 | `openai` | `o3`, `o4-mini`, `gpt-4.1` | `default` | `openai:o3` |
 | `codex` | `default` | `default` | `codex` |
-| `gemini` | `pro`, `flash` | `pro` | `gemini:flash` |
+| `gemini` | `pro`, `flash` | `default` | `gemini:flash` |
 
 If no variant is specified, the default is used (e.g., `claude` = `claude:sonnet`).
 
@@ -215,14 +228,16 @@ Location: `~/.swarm/config.json`
   "defaultSynthesizer": "claude:opus",
   "providers": {
     "claude": {
-      "auth": "cli",
+      "auth": "api",
       "apiKey": "ANTHROPIC_API_KEY"
     },
     "openai": {
-      "auth": "api"
+      "auth": "api",
+      "apiKey": "OPENAI_API_KEY"
     },
     "gemini": {
-      "auth": "cli"
+      "auth": "api",
+      "apiKey": "GEMINI_API_KEY"
     }
   }
 }
@@ -236,7 +251,7 @@ Run `swarm --init` to create a default config file.
 |--------|------|-------------|
 | `defaultAgents` | `string[]` | Default agents to use when none specified |
 | `defaultSynthesizer` | `string` | Default model for synthesis |
-| `providers.<name>.auth` | `"oauth"`, `"cli"`, or `"api"` | Authentication method |
+| `providers.<name>.auth` | `"oauth"` or `"api"` | Authentication method |
 | `providers.<name>.apiKey` | `string` | Environment variable name for API key |
 | `providers.<name>.defaultVariant` | `string` | Default variant for this provider |
 
@@ -244,9 +259,9 @@ Run `swarm --init` to create a default config file.
 
 | Variable | Description |
 |----------|-------------|
-| `ANTHROPIC_API_KEY` | For Claude API auth |
-| `OPENAI_API_KEY` | For OpenAI/Codex API auth |
-| `GEMINI_API_KEY` | For Gemini API auth |
+| `ANTHROPIC_API_KEY` | For Claude |
+| `OPENAI_API_KEY` | For OpenAI |
+| `GEMINI_API_KEY` | For Gemini |
 | `SWARM_AGENTS` | Override default agents |
 | `SWARM_SYNTHESIZER` | Override default synthesizer |
 
@@ -256,24 +271,13 @@ Run `swarm --init` to create a default config file.
 - Automatically reads OAuth tokens from CLI credential stores
 - Claude: reads from macOS Keychain (`Claude Code-credentials`) or `~/.claude/.credentials.json`
 - Codex: reads from macOS Keychain (`Codex Auth`) or `~/.codex/auth.json`
-- Uses SDK directly with OAuth token — avoids CLI hanging issues on M1 Macs
-- Best for synthesis operations (no CLI spawn required)
+- Uses SDK directly with OAuth token
+- No CLI spawning required
 
-**CLI Auth (Default)**
-- Uses the provider's installed CLI tool
-- Requires subscription to the CLI service
-- No API key needed
-- ⚠️ May hang on macOS M1 in some cases
-
-**API Auth**
-- Uses the provider's API directly
+**API Auth (Default)**
+- Uses the provider's API directly with SDK
 - Requires API key in environment
-- May have different rate limits/costs
-
-**Auth Priority:**
-1. OAuth token from CLI credentials (subscription users)
-2. API key from environment variable (API users)
-3. CLI fallback (spawns CLI tool)
+- Full control via SDK tool calling
 
 ## Decision Logging
 
@@ -309,15 +313,16 @@ Use `--no-log` to disable logging.
 ## How It Works
 
 1. **Worktree Creation**: Creates isolated git worktrees for each agent
-2. **Parallel Execution**: Runs all agents simultaneously on the same task
-3. **Result Collection**: Gathers diffs and output from each agent
-4. **Synthesis**: Analyzes all results to identify conflicts and compare approaches
-5. **Human Decision**: Presents conflicts for human resolution
-6. **Apply Changes**: Optionally applies chosen agent's changes to main branch
-7. **Logging**: Records session details to SWARM_LOG.md
-8. **Cleanup**: Removes worktrees (unless `--no-cleanup`)
+2. **Parallel Execution**: Runs all agents simultaneously using SDK tool calling
+3. **Agent Loop**: Each agent iteratively reads files, makes changes, and verifies work
+4. **Result Collection**: Gathers diffs and output from each agent
+5. **Synthesis**: Analyzes all results to identify conflicts and compare approaches
+6. **Human Decision**: Presents conflicts for human resolution
+7. **Apply Changes**: Optionally applies chosen agent's changes to main branch
+8. **Logging**: Records session details to SWARM_LOG.md
+9. **Cleanup**: Removes worktrees (unless `--no-cleanup`)
 
-## Project Structure
+## Architecture
 
 ```
 swarm-cli/
@@ -325,6 +330,7 @@ swarm-cli/
 │   ├── cli.ts           # Entry point and CLI parsing
 │   ├── orchestrator.ts  # Parallel execution management
 │   ├── synthesizer.ts   # Conflict analysis & synthesis
+│   ├── agent-loop.ts    # SDK-based agent loop with tool calling
 │   ├── config.ts        # Config file management
 │   ├── worktree.ts      # Git worktree management
 │   ├── logging.ts       # Session logging (SWARM_LOG.md)
@@ -333,12 +339,16 @@ swarm-cli/
 │   ├── auth/            # OAuth credential reading
 │   │   ├── credentials.ts # Keychain/file credential readers
 │   │   └── index.ts     # Module exports
-│   ├── models/          # Flexible model/auth system
+│   ├── tools/           # Tool definitions and executor
+│   │   ├── definitions.ts # Tool schemas for all providers
+│   │   ├── executor.ts  # Execute tool calls (file ops, shell)
+│   │   └── index.ts     # Module exports
+│   ├── models/          # SDK-based provider system
 │   │   ├── types.ts     # Model & auth types
 │   │   ├── provider.ts  # Abstract provider base
-│   │   ├── claude.ts    # Claude provider
-│   │   ├── openai.ts    # OpenAI provider
-│   │   ├── gemini.ts    # Gemini provider
+│   │   ├── claude.ts    # Claude SDK provider
+│   │   ├── openai.ts    # OpenAI SDK provider
+│   │   ├── gemini.ts    # Gemini SDK provider
 │   │   └── index.ts     # Module exports
 │   └── ui/              # Interactive Ink UI
 │       ├── App.tsx      # Main UI component
@@ -379,16 +389,17 @@ To add a new AI provider:
 
 1. Create `src/models/newprovider.ts`
 2. Implement `ModelProvider` interface
-3. Register with `ProviderRegistry`
-4. Add to `src/config.ts` validation
+3. Add tool calling support via `runAgentLoop`
+4. Register with `ProviderRegistry`
+5. Add to `src/config.ts` validation
 
 See existing providers for reference implementation.
 
 ## Troubleshooting
 
 ### "No agents available"
-- Install at least one AI CLI tool (claude, codex, or gemini)
-- Or set API keys for API auth mode
+- Set at least one API key (ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY)
+- Or ensure you have OAuth credentials from logging into the respective CLI
 - Run `swarm --list-models` to check availability
 
 ### "Worktree creation failed"
@@ -401,16 +412,24 @@ See existing providers for reference implementation.
 - Try a different synthesizer: `--synthesizer claude:sonnet`
 - Synthesis failures will show raw diffs as fallback
 
-### CLI hanging on macOS M1
-- swarm-cli now automatically uses OAuth tokens when available
-- Ensure you've logged into the CLI at least once (`claude login`, `codex auth login`)
-- OAuth tokens are read from keychain/credential files automatically
-- Set API keys as fallback: `export ANTHROPIC_API_KEY="sk-..."`
-
 ### Ctrl+C not cleaning up
 - Press Ctrl+C once for graceful shutdown
 - Press twice to force exit
 - Run `git worktree prune` to cleanup orphaned worktrees
+
+## Why SDK Instead of CLI?
+
+Previous versions spawned CLI tools (claude, codex, gemini) to run agent tasks. This approach had issues:
+- CLI hanging on macOS M1/M2
+- Limited control over agent execution
+- Complex output parsing
+- Process management overhead
+
+The current SDK-based approach:
+- Uses native tool calling for each provider
+- Full control over the agent loop
+- Consistent behavior across platforms
+- Better error handling and observability
 
 ## License
 
