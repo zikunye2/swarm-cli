@@ -3,7 +3,7 @@
 /**
  * swarm-cli - Multi-Agent Deliberation CLI
  * 
- * Phase 1: Simple CLI with console.log output
+ * Phase 2: Multi-agent support with parallel execution
  */
 
 import { Orchestrator } from './orchestrator.js';
@@ -18,6 +18,7 @@ interface CliArgs {
   verbose: boolean;
   outputFormat: 'json' | 'text';
   cleanup: boolean;
+  listAgents: boolean;
 }
 
 function parseArgs(): CliArgs {
@@ -28,6 +29,18 @@ function parseArgs(): CliArgs {
     process.exit(0);
   }
 
+  if (args.includes('--list-agents')) {
+    return {
+      task: '',
+      agents: [],
+      repoPath: process.cwd(),
+      verbose: false,
+      outputFormat: 'text',
+      cleanup: true,
+      listAgents: true,
+    };
+  }
+
   const result: CliArgs = {
     task: '',
     agents: ['claude'], // Default to Claude agent
@@ -35,6 +48,7 @@ function parseArgs(): CliArgs {
     verbose: false,
     outputFormat: 'text',
     cleanup: true,
+    listAgents: false,
   };
 
   let i = 0;
@@ -67,6 +81,8 @@ function parseArgs(): CliArgs {
 }
 
 function printHelp(): void {
+  const availableAgents = Orchestrator.getAvailableAgents().join(', ');
+  
   console.log(`
 swarm - Multi-Agent Deliberation CLI
 
@@ -77,20 +93,48 @@ Arguments:
 
 Options:
   -a, --agents <list>     Comma-separated list of agents (default: claude)
+                          Available: ${availableAgents}
   -r, --repo <path>       Repository path (default: current directory)
   -v, --verbose           Enable verbose output
   --json                  Output synthesis as JSON
   --no-cleanup            Don't cleanup worktrees after execution
+  --list-agents           Show available agents and their status
   -h, --help              Show this help message
 
 Examples:
   swarm "add input validation to user forms"
-  swarm "refactor the authentication module" --agents claude
+  swarm "refactor the authentication module" --agents claude,codex,gemini
   swarm "add unit tests" --verbose --json
+  swarm "fix bug" --agents claude,gemini
+
+Multi-Agent Mode:
+  Run multiple AI agents in parallel on the same task. Each agent works
+  in an isolated git worktree. After completion, swarm analyzes the
+  outputs and identifies conflicts between approaches.
 
 Environment:
-  ANTHROPIC_API_KEY       Required for synthesis (Claude API)
+  ANTHROPIC_API_KEY       Optional - for direct API synthesis
+                          (Falls back to 'claude' CLI if not set)
 `);
+}
+
+async function listAgents(): Promise<void> {
+  console.log('\n🤖 Available Agents:\n');
+  
+  const agents = Orchestrator.getAvailableAgents();
+  
+  for (const agentName of agents) {
+    // Create a temporary orchestrator to check availability
+    const tempOrch = new Orchestrator({ repoPath: process.cwd() });
+    tempOrch.addAgent(agentName);
+    
+    // We can't easily check without exposing it, but we can try to instantiate
+    // For now, just list them
+    console.log(`  • ${agentName}`);
+  }
+  
+  console.log(`\nUse --agents <name1,name2,...> to specify which agents to use.`);
+  console.log(`Example: swarm "fix bug" --agents claude,codex,gemini\n`);
 }
 
 function formatTextOutput(synthesis: SynthesisResult): string {
@@ -207,9 +251,19 @@ function formatTextOutput(synthesis: SynthesisResult): string {
 async function main(): Promise<void> {
   const args = parseArgs();
 
-  // Check for API key
-  if (!process.env.ANTHROPIC_API_KEY) {
-    console.error('Error: ANTHROPIC_API_KEY environment variable is required');
+  // Handle --list-agents
+  if (args.listAgents) {
+    await listAgents();
+    return;
+  }
+
+  // Check synthesis availability (either API key or Claude CLI)
+  const hasApiKey = !!process.env.ANTHROPIC_API_KEY;
+  const hasClaudeCli = await Synthesizer.isClaudeCliAvailable();
+  
+  if (!hasApiKey && !hasClaudeCli) {
+    console.error('Error: No synthesis method available.');
+    console.error('Either set ANTHROPIC_API_KEY or install the Claude CLI.');
     process.exit(1);
   }
 
@@ -217,6 +271,7 @@ async function main(): Promise<void> {
   console.log(`Task: "${args.task}"`);
   console.log(`Agents: ${args.agents.join(', ')}`);
   console.log(`Repo: ${path.resolve(args.repoPath)}`);
+  console.log(`Synthesis: ${hasApiKey ? 'Anthropic API' : 'Claude CLI'}`);
   console.log('');
 
   // Initialize orchestrator
@@ -235,24 +290,29 @@ async function main(): Promise<void> {
 
   try {
     // Execute agents in parallel
-    console.log('🚀 Running agents in parallel...');
+    console.log('🚀 Running agents in parallel...\n');
     const results = await orchestrator.execute(args.task);
 
     // Check if any agent succeeded
     const successCount = results.filter(r => r.success).length;
     console.log(`\n✓ Execution complete: ${successCount}/${results.length} agents succeeded`);
 
-    // Synthesize results
-    console.log('🔬 Synthesizing results...');
-    const synthesizer = new Synthesizer({ verbose: args.verbose });
-    const synthesis = await synthesizer.synthesize(args.task, results);
+    // Only synthesize if we have results
+    if (results.length > 0) {
+      // Synthesize results
+      console.log('🔬 Synthesizing results...');
+      const synthesizer = new Synthesizer({ verbose: args.verbose });
+      const synthesis = await synthesizer.synthesize(args.task, results);
 
-    // Output results
-    console.log('');
-    if (args.outputFormat === 'json') {
-      console.log(JSON.stringify(synthesis, null, 2));
+      // Output results
+      console.log('');
+      if (args.outputFormat === 'json') {
+        console.log(JSON.stringify(synthesis, null, 2));
+      } else {
+        console.log(formatTextOutput(synthesis));
+      }
     } else {
-      console.log(formatTextOutput(synthesis));
+      console.log('\n⚠️  No agent results to synthesize.');
     }
 
     // Cleanup

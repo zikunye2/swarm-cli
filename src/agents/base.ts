@@ -13,8 +13,12 @@ export interface Agent {
   
   /**
    * Execute the agent with the given task in the specified worktree
+   * @param task - The task description
+   * @param worktreePath - Path to the git worktree
+   * @param branchName - Name of the branch
+   * @param baseCommit - The commit SHA to diff against (stored when worktree was created)
    */
-  execute(task: string, worktreePath: string, branchName: string): Promise<AgentResult>;
+  execute(task: string, worktreePath: string, branchName: string, baseCommit?: string): Promise<AgentResult>;
   
   /**
    * Check if the agent is available (CLI installed, etc.)
@@ -29,7 +33,7 @@ export abstract class BaseAgent implements Agent {
   abstract readonly name: string;
   abstract readonly config: AgentConfig;
 
-  abstract execute(task: string, worktreePath: string, branchName: string): Promise<AgentResult>;
+  abstract execute(task: string, worktreePath: string, branchName: string, baseCommit?: string): Promise<AgentResult>;
 
   /**
    * Default availability check - can be overridden

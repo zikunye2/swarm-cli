@@ -1,5 +1,5 @@
 /**
- * Claude Code CLI agent implementation
+ * Gemini CLI agent implementation
  */
 
 import { spawn } from 'node:child_process';
@@ -7,27 +7,27 @@ import { Agent, BaseAgent, AgentRegistry } from './base.js';
 import { AgentResult, AgentConfig } from '../types.js';
 import { simpleGit } from 'simple-git';
 
-export class ClaudeAgent extends BaseAgent implements Agent {
-  readonly name = 'claude';
+export class GeminiAgent extends BaseAgent implements Agent {
+  readonly name = 'gemini';
   readonly config: AgentConfig;
 
   constructor(timeout: number = 300000) { // 5 min default
     super();
     this.config = {
-      name: 'claude',
-      command: 'claude',
-      args: ['-p', '--dangerously-skip-permissions'],
+      name: 'gemini',
+      command: 'gemini',
+      args: ['--prompt'],
       timeout,
     };
   }
 
   /**
-   * Check if Claude CLI is installed
+   * Check if Gemini CLI is installed
    */
   async isAvailable(): Promise<boolean> {
     return new Promise((resolve) => {
-      // No shell: true - pass args as array to prevent injection
-      const proc = spawn('claude', ['--version'], {
+      const proc = spawn('which', ['gemini'], {
+        shell: true,
         stdio: 'pipe',
       });
       
@@ -42,10 +42,9 @@ export class ClaudeAgent extends BaseAgent implements Agent {
   }
 
   /**
-   * Execute Claude CLI with the given task
-   * @param baseCommit - The commit SHA to diff against (before agent changes)
+   * Execute Gemini CLI with the given task
    */
-  async execute(task: string, worktreePath: string, branchName: string, baseCommit?: string): Promise<AgentResult> {
+  async execute(task: string, worktreePath: string, branchName: string): Promise<AgentResult> {
     const startTime = Date.now();
     
     return new Promise((resolve) => {
@@ -55,14 +54,18 @@ export class ClaudeAgent extends BaseAgent implements Agent {
       // Build the prompt with context
       const fullPrompt = this.buildPrompt(task);
 
-      // Spawn Claude CLI - NO shell: true to prevent shell injection
-      // Task/prompt is passed as a separate argument, not interpreted by shell
-      const proc = spawn('claude', ['-p', fullPrompt, '--dangerously-skip-permissions'], {
+      // Spawn Gemini CLI with --prompt flag for non-interactive mode
+      // Gemini CLI uses: gemini --prompt "prompt"
+      const proc = spawn('gemini', [
+        '--prompt', fullPrompt,
+        '--sandbox', 'false',  // Allow file system access
+      ], {
         cwd: worktreePath,
+        shell: true,
         stdio: 'pipe',
         env: {
           ...process.env,
-          // Ensure Claude has access to necessary env vars
+          // Gemini may need GOOGLE_API_KEY or GEMINI_API_KEY
         },
       });
 
@@ -101,24 +104,14 @@ export class ClaudeAgent extends BaseAgent implements Agent {
           // Stage and commit changes if any
           if (filesChanged.length > 0) {
             await git.add('.');
-            await git.commit(`Swarm: ${task.slice(0, 50)}...`, { '--allow-empty': null });
+            await git.commit(`Swarm (Gemini): ${task.slice(0, 50)}...`, { '--allow-empty': null });
           }
 
-          // Get the diff against the base commit (stored when worktree was created)
-          // This correctly shows all changes made by the agent, not just HEAD~1
-          if (baseCommit) {
-            diff = await git.diff([baseCommit, 'HEAD']);
-          } else {
-            // Fallback: try to diff against main/master
-            try {
-              diff = await git.diff(['main', 'HEAD']);
-            } catch {
-              try {
-                diff = await git.diff(['master', 'HEAD']);
-              } catch {
-                diff = await git.diff(['HEAD']);
-              }
-            }
+          // Get the diff
+          try {
+            diff = await git.diff(['HEAD~1', 'HEAD']);
+          } catch {
+            diff = await git.diff(['HEAD']);
           }
         } catch (err) {
           // Git operations failed, continue with what we have
@@ -147,10 +140,10 @@ export class ClaudeAgent extends BaseAgent implements Agent {
   }
 
   /**
-   * Build the full prompt for Claude
+   * Build the full prompt for Gemini
    */
   private buildPrompt(task: string): string {
-    return `You are working on a coding task in a git worktree. Complete the following task:
+    return `You are working on a coding task in a git repository. Complete the following task:
 
 TASK: ${task}
 
@@ -164,7 +157,7 @@ Focus on completing the task efficiently and correctly.`;
   }
 }
 
-// Register the Claude agent
-AgentRegistry.register('claude', () => new ClaudeAgent());
+// Register the Gemini agent
+AgentRegistry.register('gemini', () => new GeminiAgent());
 
-export default ClaudeAgent;
+export default GeminiAgent;

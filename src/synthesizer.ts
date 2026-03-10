@@ -3,9 +3,14 @@
  * 
  * THIS IS THE MOST CRITICAL PART OF SWARM-CLI
  * The quality of conflict analysis determines the product's value
+ * 
+ * Supports two modes:
+ * 1. Direct API (requires ANTHROPIC_API_KEY)
+ * 2. Claude CLI fallback (uses `claude` command)
  */
 
 import Anthropic from '@anthropic-ai/sdk';
+import { spawn } from 'node:child_process';
 import {
   AgentResult,
   SynthesisResult,
@@ -18,22 +23,41 @@ export interface SynthesizerOptions {
   model?: string;
   maxTokens?: number;
   verbose?: boolean;
+  useClaudeCli?: boolean; // Force Claude CLI mode
 }
 
 export class Synthesizer {
-  private client: Anthropic;
+  private client: Anthropic | null = null;
   private options: SynthesizerOptions;
+  private useClaudeCli: boolean;
 
   constructor(options: SynthesizerOptions = {}) {
     this.options = {
       model: 'claude-sonnet-4-20250514',
       maxTokens: 8192,
       verbose: false,
+      useClaudeCli: false,
       ...options,
     };
 
-    // Initialize Anthropic client (uses ANTHROPIC_API_KEY env var)
-    this.client = new Anthropic();
+    // Determine if we should use Claude CLI or API
+    this.useClaudeCli = options.useClaudeCli || !process.env.ANTHROPIC_API_KEY;
+
+    if (!this.useClaudeCli) {
+      // Initialize Anthropic client (uses ANTHROPIC_API_KEY env var)
+      try {
+        this.client = new Anthropic();
+      } catch (err) {
+        this.log('Failed to initialize Anthropic client, falling back to Claude CLI');
+        this.useClaudeCli = true;
+      }
+    }
+
+    if (this.useClaudeCli) {
+      this.log('Using Claude CLI for synthesis (no API key required)');
+    } else {
+      this.log('Using Anthropic API for synthesis');
+    }
   }
 
   /**
@@ -45,7 +69,29 @@ export class Synthesizer {
     // Build the analysis prompt
     const prompt = this.buildAnalysisPrompt(task, results);
 
-    // Call Claude API for analysis
+    let analysisText: string;
+
+    if (this.useClaudeCli) {
+      analysisText = await this.callClaudeCli(prompt);
+    } else {
+      analysisText = await this.callAnthropicApi(prompt);
+    }
+
+    // Parse the structured response
+    const synthesis = this.parseAnalysis(task, results, analysisText);
+
+    this.log('Synthesis complete.');
+    return synthesis;
+  }
+
+  /**
+   * Call Claude via direct API
+   */
+  private async callAnthropicApi(prompt: string): Promise<string> {
+    if (!this.client) {
+      throw new Error('Anthropic client not initialized');
+    }
+
     const response = await this.client.messages.create({
       model: this.options.model!,
       max_tokens: this.options.maxTokens!,
@@ -58,16 +104,75 @@ export class Synthesizer {
     });
 
     // Extract text from response
-    const analysisText = response.content
+    return response.content
       .filter((block): block is Anthropic.TextBlock => block.type === 'text')
       .map((block) => block.text)
       .join('\n');
+  }
 
-    // Parse the structured response
-    const synthesis = this.parseAnalysis(task, results, analysisText);
+  /**
+   * Call Claude via CLI as fallback
+   */
+  private async callClaudeCli(prompt: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      let output = '';
+      let errorOutput = '';
 
-    this.log('Synthesis complete.');
-    return synthesis;
+      // Use claude CLI in print mode
+      const proc = spawn('claude', ['-p', prompt], {
+        shell: true,
+        stdio: 'pipe',
+        env: process.env,
+      });
+
+      proc.stdout?.on('data', (data) => {
+        output += data.toString();
+      });
+
+      proc.stderr?.on('data', (data) => {
+        errorOutput += data.toString();
+      });
+
+      // 5 minute timeout for synthesis
+      const timeout = setTimeout(() => {
+        proc.kill('SIGTERM');
+        reject(new Error('Claude CLI synthesis timed out'));
+      }, 300000);
+
+      proc.on('close', (code) => {
+        clearTimeout(timeout);
+        if (code === 0) {
+          resolve(output.trim());
+        } else {
+          reject(new Error(`Claude CLI exited with code ${code}: ${errorOutput}`));
+        }
+      });
+
+      proc.on('error', (err) => {
+        clearTimeout(timeout);
+        reject(new Error(`Failed to spawn Claude CLI: ${err.message}`));
+      });
+    });
+  }
+
+  /**
+   * Check if Claude CLI is available
+   */
+  static async isClaudeCliAvailable(): Promise<boolean> {
+    return new Promise((resolve) => {
+      const proc = spawn('which', ['claude'], {
+        shell: true,
+        stdio: 'pipe',
+      });
+
+      proc.on('close', (code) => {
+        resolve(code === 0);
+      });
+
+      proc.on('error', () => {
+        resolve(false);
+      });
+    });
   }
 
   /**
