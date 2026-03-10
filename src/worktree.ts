@@ -32,7 +32,9 @@ export class WorktreeManager {
     const timestamp = Date.now();
     const randomSuffix = this.generateRandomSuffix();
     // Add random suffix to prevent branch name collisions
-    const branchName = `swarm/${agentName}-${timestamp}-${randomSuffix}`;
+    // Replace invalid characters in branch names (e.g., colons from claude:sonnet)
+    const safeName = agentName.replace(/[^a-zA-Z0-9-_]/g, '-');
+    const branchName = `swarm/${safeName}-${timestamp}-${randomSuffix}`;
     const worktreePath = path.join(this.repoPath, '..', `.swarm-worktrees`, `${agentName}-${timestamp}-${randomSuffix}`);
 
     // Ensure worktrees directory exists
