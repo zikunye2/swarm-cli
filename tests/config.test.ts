@@ -81,7 +81,18 @@ describe('validateConfig', () => {
     };
     const result = validateConfig(config);
     assert.strictEqual(result.valid, false);
-    assert.ok(result.errors.some(e => e.includes('must be "api" or "cli"')));
+    assert.ok(result.errors.some(e => e.includes('must be "oauth", "api", or "cli"')));
+  });
+
+  test('accepts oauth auth type', () => {
+    const config = {
+      providers: {
+        claude: { auth: 'oauth' },
+      },
+    };
+    const result = validateConfig(config);
+    assert.strictEqual(result.valid, true);
+    assert.deepStrictEqual(result.errors, []);
   });
 
   test('accepts empty config', () => {

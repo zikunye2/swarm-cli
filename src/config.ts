@@ -239,8 +239,8 @@ export function validateConfig(config: unknown): { valid: boolean; errors: strin
         
         const pc = providerCfg as Record<string, unknown>;
         
-        if (pc.auth !== undefined && pc.auth !== 'api' && pc.auth !== 'cli') {
-          errors.push(`Provider ${name}: auth must be "api" or "cli"`);
+        if (pc.auth !== undefined && pc.auth !== 'oauth' && pc.auth !== 'api' && pc.auth !== 'cli') {
+          errors.push(`Provider ${name}: auth must be "oauth", "api", or "cli"`);
         }
       }
     }

@@ -2,8 +2,11 @@
  * Gemini provider implementation
  * 
  * Supports:
- * - CLI auth: Uses `gemini` CLI (Google Gemini CLI for subscription users)
- * - API auth: Uses Google AI SDK with GEMINI_API_KEY
+ * - OAuth auth: Uses OAuth token from Gemini CLI credentials (if available)
+ * - API auth: Uses Google AI SDK with GEMINI_API_KEY or GOOGLE_API_KEY
+ * - CLI auth: Falls back to spawning `gemini` CLI
+ * 
+ * For synthesis, ALWAYS uses SDK when credentials are available.
  */
 
 import { spawn } from 'node:child_process';
@@ -14,6 +17,12 @@ import {
   ModelResponse,
   AgentResult,
 } from './types.js';
+import {
+  readGeminiCredentials,
+  isExpired,
+  Credentials,
+  getAccessToken,
+} from '../auth/index.js';
 
 const GEMINI_DEFINITION: ProviderDefinition = {
   name: 'gemini',
@@ -32,9 +41,13 @@ const GEMINI_DEFINITION: ProviderDefinition = {
 
 export class GeminiProvider extends ModelProvider {
   readonly definition = GEMINI_DEFINITION;
+  private oauthCredentials: Credentials | null = null;
 
   constructor(variant: string = 'default', authType: AuthType = 'cli', timeout?: number) {
     super(variant, authType, timeout);
+    
+    // Try to read OAuth credentials from Gemini CLI
+    this.oauthCredentials = readGeminiCredentials();
   }
 
   protected getDefinition(): ProviderDefinition {
@@ -45,11 +58,22 @@ export class GeminiProvider extends ModelProvider {
    * Check if Gemini is available
    */
   async checkAvailable(): Promise<boolean> {
-    if (this.authType === 'api') {
-      return !!process.env.GEMINI_API_KEY || !!process.env.GOOGLE_API_KEY;
-    } else {
+    // Check OAuth credentials first
+    if (this.oauthCredentials && !isExpired(this.oauthCredentials)) {
+      return true;
+    }
+
+    // Check API keys
+    if (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY) {
+      return true;
+    }
+
+    // Fall back to CLI check
+    if (this.authType === 'cli') {
       return this.checkCliAvailable('gemini');
     }
+
+    return false;
   }
 
   /**
@@ -64,7 +88,7 @@ export class GeminiProvider extends ModelProvider {
     const startTime = Date.now();
     const prompt = this.buildAgentPrompt(task);
 
-    // Use Gemini CLI
+    // Use Gemini CLI for agent tasks (has tools, file access)
     const { stdout, stderr, code } = await this.execCli(
       'gemini',
       ['--prompt', prompt, '--sandbox', 'false'],
@@ -87,27 +111,34 @@ export class GeminiProvider extends ModelProvider {
 
   /**
    * Run as synthesizer
+   * 
+   * ALWAYS uses SDK when credentials are available.
    */
   async runAsSynthesizer(prompt: string): Promise<ModelResponse> {
-    if (this.authType === 'api' && (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY)) {
-      return this.synthesizeViaApi(prompt);
-    } else {
-      return this.synthesizeViaCli(prompt);
+    // Try OAuth credentials first
+    if (this.oauthCredentials && !isExpired(this.oauthCredentials)) {
+      const token = getAccessToken(this.oauthCredentials);
+      return this.synthesizeViaApi(prompt, token);
     }
+
+    // Try API keys
+    const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+    if (apiKey) {
+      return this.synthesizeViaApi(prompt, apiKey);
+    }
+
+    // No SDK credentials available - fall back to CLI
+    console.warn('[gemini] No OAuth/API credentials found, falling back to CLI');
+    return this.synthesizeViaCli(prompt);
   }
 
   /**
    * Synthesize using Google AI API
    */
-  private async synthesizeViaApi(prompt: string): Promise<ModelResponse> {
+  private async synthesizeViaApi(prompt: string, apiKey: string): Promise<ModelResponse> {
     // Dynamic import to avoid requiring @google/generative-ai if not using API
     const { GoogleGenerativeAI } = await import('@google/generative-ai');
-    const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
     
-    if (!apiKey) {
-      throw new Error('GEMINI_API_KEY or GOOGLE_API_KEY not set');
-    }
-
     const genAI = new GoogleGenerativeAI(apiKey);
     const model = genAI.getGenerativeModel({ model: this.variant.apiModel || 'gemini-2.0-flash' });
 
@@ -125,7 +156,7 @@ export class GeminiProvider extends ModelProvider {
   }
 
   /**
-   * Synthesize using Gemini CLI
+   * Synthesize using Gemini CLI (fallback)
    */
   private async synthesizeViaCli(prompt: string): Promise<ModelResponse> {
     return new Promise((resolve, reject) => {

@@ -7,7 +7,10 @@
  */
 
 // Authentication strategies
-export type AuthType = 'api' | 'cli';
+// - 'oauth': Uses OAuth token from CLI credentials (subscription users)
+// - 'api': Uses SDK with env var (e.g., ANTHROPIC_API_KEY)
+// - 'cli': Spawns the provider's CLI tool (e.g., claude, gemini, codex) - may hang on M1 Macs
+export type AuthType = 'oauth' | 'api' | 'cli';
 
 export interface AuthStrategy {
   type: AuthType;

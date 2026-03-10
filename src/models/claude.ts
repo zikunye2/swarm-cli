@@ -2,8 +2,11 @@
  * Claude provider implementation
  * 
  * Supports:
- * - CLI auth: Uses `claude` CLI (for Claude Code / subscription users)
+ * - OAuth auth: Uses OAuth token from Claude CLI credentials (for subscription users)
  * - API auth: Uses Anthropic SDK with ANTHROPIC_API_KEY
+ * - CLI auth: Falls back to spawning `claude` CLI (legacy, may hang on M1)
+ * 
+ * For synthesis, ALWAYS uses SDK to avoid CLI hanging issues.
  */
 
 import Anthropic from '@anthropic-ai/sdk';
@@ -15,6 +18,12 @@ import {
   ModelResponse,
   AgentResult,
 } from './types.js';
+import {
+  readClaudeCredentials,
+  getAccessToken,
+  isExpired,
+  Credentials,
+} from '../auth/index.js';
 
 const CLAUDE_DEFINITION: ProviderDefinition = {
   name: 'claude',
@@ -33,19 +42,52 @@ const CLAUDE_DEFINITION: ProviderDefinition = {
 
 export class ClaudeProvider extends ModelProvider {
   readonly definition = CLAUDE_DEFINITION;
-  private client: Anthropic | null = null;
+  private apiClient: Anthropic | null = null;
+  private oauthClient: Anthropic | null = null;
+  private oauthCredentials: Credentials | null = null;
 
   constructor(variant: string = 'sonnet', authType: AuthType = 'cli', timeout?: number) {
     super(variant, authType, timeout);
-    
-    // Initialize API client if using API auth
-    if (this.authType === 'api' && process.env.ANTHROPIC_API_KEY) {
+    this.initializeClients();
+  }
+
+  /**
+   * Initialize API clients based on available credentials
+   */
+  private initializeClients(): void {
+    // Try API key first
+    if (process.env.ANTHROPIC_API_KEY) {
       try {
-        this.client = new Anthropic();
-      } catch (err) {
-        // Will fall back to CLI
+        this.apiClient = new Anthropic();
+      } catch {
+        // Ignore initialization errors
       }
     }
+
+    // Try OAuth credentials from Claude CLI
+    this.oauthCredentials = readClaudeCredentials();
+    if (this.oauthCredentials && !isExpired(this.oauthCredentials)) {
+      try {
+        const token = getAccessToken(this.oauthCredentials);
+        this.oauthClient = new Anthropic({
+          apiKey: token,
+        });
+      } catch {
+        // Ignore initialization errors
+      }
+    }
+  }
+
+  /**
+   * Get the best available client (prefers OAuth for subscription users)
+   */
+  private getClient(): Anthropic | null {
+    // Prefer OAuth client (subscription users)
+    if (this.oauthClient && this.oauthCredentials && !isExpired(this.oauthCredentials)) {
+      return this.oauthClient;
+    }
+    // Fall back to API key client
+    return this.apiClient;
   }
 
   protected getDefinition(): ProviderDefinition {
@@ -56,15 +98,29 @@ export class ClaudeProvider extends ModelProvider {
    * Check if Claude is available with current auth method
    */
   async checkAvailable(): Promise<boolean> {
-    if (this.authType === 'api') {
-      return !!process.env.ANTHROPIC_API_KEY && this.client !== null;
-    } else {
+    // Check OAuth credentials first
+    if (this.oauthClient && this.oauthCredentials && !isExpired(this.oauthCredentials)) {
+      return true;
+    }
+
+    // Check API key
+    if (this.apiClient && process.env.ANTHROPIC_API_KEY) {
+      return true;
+    }
+
+    // Fall back to CLI check
+    if (this.authType === 'cli') {
       return this.checkCliAvailable('claude');
     }
+
+    return false;
   }
 
   /**
    * Run as a coding agent using CLI
+   * 
+   * Note: For agent tasks, we still use CLI because it has file editing tools,
+   * bash access, etc. The SDK alone cannot perform coding tasks.
    */
   async runAsAgent(
     task: string,
@@ -75,8 +131,7 @@ export class ClaudeProvider extends ModelProvider {
     const startTime = Date.now();
     const prompt = this.buildAgentPrompt(task);
 
-    // Claude CLI is the primary way to run as agent
-    // API mode is mainly for synthesis
+    // Claude CLI is required for agent tasks (has tools, file access)
     const { stdout, stderr, code } = await this.execCli(
       'claude',
       ['-p', prompt, '--dangerously-skip-permissions'],
@@ -99,24 +154,28 @@ export class ClaudeProvider extends ModelProvider {
 
   /**
    * Run as synthesizer (for analyzing agent outputs)
+   * 
+   * ALWAYS uses SDK to avoid CLI hanging issues on macOS M1.
+   * This is just prompt → response, no tools required.
    */
   async runAsSynthesizer(prompt: string): Promise<ModelResponse> {
-    if (this.authType === 'api' && this.client) {
-      return this.synthesizeViaApi(prompt);
-    } else {
-      return this.synthesizeViaCli(prompt);
+    // ALWAYS try SDK first - avoids CLI hanging issues
+    const client = this.getClient();
+    
+    if (client) {
+      return this.synthesizeViaApi(client, prompt);
     }
+
+    // No SDK client available - last resort is CLI (may hang on M1)
+    console.warn('[claude] No OAuth/API credentials found, falling back to CLI (may hang on M1 Macs)');
+    return this.synthesizeViaCli(prompt);
   }
 
   /**
    * Synthesize using Anthropic API
    */
-  private async synthesizeViaApi(prompt: string): Promise<ModelResponse> {
-    if (!this.client) {
-      throw new Error('Anthropic client not initialized');
-    }
-
-    const response = await this.client.messages.create({
+  private async synthesizeViaApi(client: Anthropic, prompt: string): Promise<ModelResponse> {
+    const response = await client.messages.create({
       model: this.variant.apiModel!,
       max_tokens: 8192,
       messages: [
@@ -139,7 +198,7 @@ export class ClaudeProvider extends ModelProvider {
   }
 
   /**
-   * Synthesize using Claude CLI
+   * Synthesize using Claude CLI (fallback, may hang on M1)
    */
   private async synthesizeViaCli(prompt: string): Promise<ModelResponse> {
     return new Promise((resolve, reject) => {
@@ -161,7 +220,7 @@ export class ClaudeProvider extends ModelProvider {
 
       const timeout = setTimeout(() => {
         proc.kill('SIGTERM');
-        reject(new Error('Claude CLI synthesis timed out'));
+        reject(new Error('Claude CLI synthesis timed out (consider using OAuth or API key to avoid this issue)'));
       }, this.timeout);
 
       proc.on('close', (code) => {
