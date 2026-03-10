@@ -1,0 +1,36 @@
+{
+  "name": "swarm-cli",
+  "version": "0.1.0",
+  "description": "Multi-Agent Deliberation CLI - runs coding tasks across multiple AI CLI agents in parallel, then synthesizes conflicts for human decision",
+  "type": "module",
+  "main": "dist/cli.js",
+  "bin": {
+    "swarm": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/cli.js",
+    "test": "node --test"
+  },
+  "keywords": [
+    "ai",
+    "cli",
+    "multi-agent",
+    "claude",
+    "deliberation"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "simple-git": "^3.27.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
