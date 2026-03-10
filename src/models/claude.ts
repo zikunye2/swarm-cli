@@ -1,16 +1,15 @@
 /**
- * Claude provider implementation
+ * Claude provider implementation - SDK-based
+ * 
+ * Uses Anthropic SDK for both agent tasks and synthesis.
+ * No more CLI spawning for agent tasks - full SDK control.
  * 
  * Supports:
- * - OAuth auth: Uses OAuth token from Claude CLI credentials (for subscription users)
+ * - OAuth auth: Uses OAuth token from Claude CLI credentials (subscription users)
  * - API auth: Uses Anthropic SDK with ANTHROPIC_API_KEY
- * - CLI auth: Falls back to spawning `claude` CLI (legacy, may hang on M1)
- * 
- * For synthesis, ALWAYS uses SDK to avoid CLI hanging issues.
  */
 
 import Anthropic from '@anthropic-ai/sdk';
-import { spawn } from 'node:child_process';
 import { ModelProvider, ProviderRegistry } from './provider.js';
 import {
   AuthType,
@@ -24,6 +23,7 @@ import {
   isExpired,
   Credentials,
 } from '../auth/index.js';
+import { runAgentLoop } from '../agent-loop.js';
 
 const CLAUDE_DEFINITION: ProviderDefinition = {
   name: 'claude',
@@ -34,8 +34,8 @@ const CLAUDE_DEFINITION: ProviderDefinition = {
     { id: 'haiku', apiModel: 'claude-3-5-haiku-latest', displayName: 'Claude Haiku' },
   ],
   authStrategies: [
-    { type: 'cli', cliCommand: 'claude' },
     { type: 'api', envVar: 'ANTHROPIC_API_KEY' },
+    { type: 'oauth' }, // OAuth from Claude CLI credentials
   ],
   defaultVariant: 'sonnet',
 };
@@ -46,7 +46,7 @@ export class ClaudeProvider extends ModelProvider {
   private oauthClient: Anthropic | null = null;
   private oauthCredentials: Credentials | null = null;
 
-  constructor(variant: string = 'sonnet', authType: AuthType = 'cli', timeout?: number) {
+  constructor(variant: string = 'sonnet', authType: AuthType = 'api', timeout?: number) {
     super(variant, authType, timeout);
     this.initializeClients();
   }
@@ -108,19 +108,14 @@ export class ClaudeProvider extends ModelProvider {
       return true;
     }
 
-    // Fall back to CLI check
-    if (this.authType === 'cli') {
-      return this.checkCliAvailable('claude');
-    }
-
     return false;
   }
 
   /**
-   * Run as a coding agent using CLI
+   * Run as a coding agent using SDK with tool calling
    * 
-   * Note: For agent tasks, we still use CLI because it has file editing tools,
-   * bash access, etc. The SDK alone cannot perform coding tasks.
+   * This is the new SDK-based implementation that replaces CLI spawning.
+   * The agent loop handles tool calling natively through the Anthropic SDK.
    */
   async runAsAgent(
     task: string,
@@ -129,54 +124,76 @@ export class ClaudeProvider extends ModelProvider {
     baseCommit?: string
   ): Promise<AgentResult> {
     const startTime = Date.now();
-    const prompt = this.buildAgentPrompt(task);
+    const client = this.getClient();
 
-    // Claude CLI is required for agent tasks (has tools, file access)
-    const { stdout, stderr, code } = await this.execCli(
-      'claude',
-      ['-p', prompt, '--dangerously-skip-permissions'],
-      worktreePath
-    );
+    if (!client) {
+      return this.createAgentResult(
+        this.name,
+        worktreePath,
+        branchName,
+        baseCommit,
+        {
+          output: '',
+          error: 'No Claude credentials available. Set ANTHROPIC_API_KEY or authenticate with Claude CLI.',
+          success: false,
+          durationMs: Date.now() - startTime,
+        }
+      );
+    }
 
-    return this.createAgentResult(
-      this.name,
-      worktreePath,
-      branchName,
-      baseCommit,
-      {
-        output: stdout,
-        error: stderr || undefined,
-        success: code === 0,
-        durationMs: Date.now() - startTime,
-      }
-    );
+    try {
+      const result = await runAgentLoop({
+        provider: 'claude',
+        model: this.variant.apiModel || 'claude-sonnet-4-20250514',
+        task,
+        workdir: worktreePath,
+        maxIterations: 30,
+        verbose: false,
+        claudeClient: client,
+      });
+
+      return this.createAgentResult(
+        this.name,
+        worktreePath,
+        branchName,
+        baseCommit,
+        {
+          output: result.output,
+          error: result.error,
+          success: result.success,
+          durationMs: Date.now() - startTime,
+        }
+      );
+    } catch (err: any) {
+      return this.createAgentResult(
+        this.name,
+        worktreePath,
+        branchName,
+        baseCommit,
+        {
+          output: '',
+          error: err.message || String(err),
+          success: false,
+          durationMs: Date.now() - startTime,
+        }
+      );
+    }
   }
 
   /**
    * Run as synthesizer (for analyzing agent outputs)
    * 
-   * ALWAYS uses SDK to avoid CLI hanging issues on macOS M1.
-   * This is just prompt → response, no tools required.
+   * Uses SDK for simple prompt → response (no tools needed).
    */
   async runAsSynthesizer(prompt: string): Promise<ModelResponse> {
-    // ALWAYS try SDK first - avoids CLI hanging issues
     const client = this.getClient();
     
-    if (client) {
-      return this.synthesizeViaApi(client, prompt);
+    if (!client) {
+      throw new Error('No Claude credentials available. Set ANTHROPIC_API_KEY or authenticate with Claude CLI.');
     }
 
-    // No SDK client available - last resort is CLI (may hang on M1)
-    console.warn('[claude] No OAuth/API credentials found, falling back to CLI (may hang on M1 Macs)');
-    return this.synthesizeViaCli(prompt);
-  }
-
-  /**
-   * Synthesize using Anthropic API
-   */
-  private async synthesizeViaApi(client: Anthropic, prompt: string): Promise<ModelResponse> {
     const response = await client.messages.create({
-      model: this.variant.apiModel!,
+      model: this.variant.apiModel || 'claude-sonnet-4-20250514',
       max_tokens: 8192,
       messages: [
         { role: 'user', content: prompt },
@@ -195,48 +212,6 @@ export class ClaudeProvider extends ModelProvider {
         outputTokens: response.usage.output_tokens,
       },
     };
-  }
-
-  /**
-   * Synthesize using Claude CLI (fallback, may hang on M1)
-   */
-  private async synthesizeViaCli(prompt: string): Promise<ModelResponse> {
-    return new Promise((resolve, reject) => {
-      let output = '';
-      let errorOutput = '';
-
-      const proc = spawn('claude', ['-p', prompt], {
-        stdio: 'pipe',
-        env: process.env,
-      });
-
-      proc.stdout?.on('data', (data) => {
-        output += data.toString();
-      });
-
-      proc.stderr?.on('data', (data) => {
-        errorOutput += data.toString();
-      });
-
-      const timeout = setTimeout(() => {
-        proc.kill('SIGTERM');
-        reject(new Error('Claude CLI synthesis timed out (consider using OAuth or API key to avoid this issue)'));
-      }, this.timeout);
-
-      proc.on('close', (code) => {
-        clearTimeout(timeout);
-        if (code === 0) {
-          resolve({ content: output.trim() });
-        } else {
-          reject(new Error(`Claude CLI exited with code ${code}: ${errorOutput}`));
-        }
-      });
-
-      proc.on('error', (err) => {
-        clearTimeout(timeout);
-        reject(new Error(`Failed to spawn Claude CLI: ${err.message}`));
-      });
-    });
   }
 }
 

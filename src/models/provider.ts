@@ -1,11 +1,12 @@
 /**
- * Abstract base class for model providers
+ * Abstract base class for model providers - SDK-based
  * 
  * Each provider (Claude, OpenAI, Gemini) implements this interface
- * to support both API and CLI auth modes.
+ * using their respective SDKs with tool calling.
+ * 
+ * No more CLI spawning - all providers use pure SDK.
  */
 
-import { spawn } from 'node:child_process';
 import { simpleGit } from 'simple-git';
 import {
   AuthType,
@@ -45,6 +46,7 @@ export abstract class ModelProvider {
 
   /**
    * Run as a coding agent in a worktree
+   * Now uses SDK with tool calling instead of spawning CLI
    */
   abstract runAsAgent(
     task: string,
@@ -80,60 +82,6 @@ export abstract class ModelProvider {
    * Get definition - workaround for calling from constructor
    */
   protected abstract getDefinition(): ProviderDefinition;
-
-  /**
-   * Execute a CLI command and return output
-   */
-  protected async execCli(
-    command: string,
-    args: string[],
-    cwd?: string
-  ): Promise<{ stdout: string; stderr: string; code: number }> {
-    return new Promise((resolve) => {
-      let stdout = '';
-      let stderr = '';
-
-      const proc = spawn(command, args, {
-        cwd,
-        stdio: 'pipe',
-        env: process.env,
-      });
-
-      proc.stdout?.on('data', (data) => {
-        stdout += data.toString();
-      });
-
-      proc.stderr?.on('data', (data) => {
-        stderr += data.toString();
-      });
-
-      const timeoutId = setTimeout(() => {
-        proc.kill('SIGTERM');
-        setTimeout(() => proc.kill('SIGKILL'), 5000);
-      }, this.timeout);
-
-      proc.on('close', (code) => {
-        clearTimeout(timeoutId);
-        resolve({ stdout: stdout.trim(), stderr: stderr.trim(), code: code ?? 1 });
-      });
-
-      proc.on('error', (err) => {
-        clearTimeout(timeoutId);
-        resolve({ stdout: '', stderr: err.message, code: 1 });
-      });
-    });
-  }
-
-  /**
-   * Check if a CLI command is available
-   */
-  protected async checkCliAvailable(command: string): Promise<boolean> {
-    return new Promise((resolve) => {
-      const proc = spawn(command, ['--version'], { stdio: 'pipe' });
-      proc.on('close', (code) => resolve(code === 0));
-      proc.on('error', () => resolve(false));
-    });
-  }
 
   /**
    * Common agent execution logic - handles git operations
@@ -193,23 +141,6 @@ export abstract class ModelProvider {
       filesChanged,
       diff,
     };
-  }
-
-  /**
-   * Build the standard agent prompt
-   */
-  protected buildAgentPrompt(task: string): string {
-    return `You are working on a coding task in a git repository. Complete the following task:
-
-TASK: ${task}
-
-Instructions:
-1. Analyze the codebase to understand the context
-2. Make the necessary changes to complete the task
-3. Ensure code quality and follow existing patterns
-4. Do NOT commit - changes will be committed automatically
-
-Focus on completing the task efficiently and correctly.`;
   }
 }
 

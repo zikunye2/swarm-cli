@@ -1,15 +1,15 @@
 /**
- * OpenAI provider implementation
+ * OpenAI provider implementation - SDK-based
+ * 
+ * Uses OpenAI SDK for both agent tasks and synthesis.
+ * No more CLI spawning for agent tasks - full SDK control.
  * 
  * Supports:
- * - OAuth auth: Uses OAuth token from Codex CLI credentials (for subscription users)
+ * - OAuth auth: Uses OAuth token from Codex CLI credentials (subscription users)
  * - API auth: Uses OpenAI SDK with OPENAI_API_KEY
- * - CLI auth: Falls back to spawning `codex` CLI (legacy, may hang)
- * 
- * For synthesis, ALWAYS uses SDK to avoid CLI hanging issues.
  */
 
-import { spawn } from 'node:child_process';
+import OpenAI from 'openai';
 import { ModelProvider, ProviderRegistry } from './provider.js';
 import {
   AuthType,
@@ -22,6 +22,7 @@ import {
   isExpired,
   OAuthCredentials,
 } from '../auth/index.js';
+import { runAgentLoop } from '../agent-loop.js';
 
 const OPENAI_DEFINITION: ProviderDefinition = {
   name: 'openai',
@@ -33,8 +34,8 @@ const OPENAI_DEFINITION: ProviderDefinition = {
     { id: 'default', apiModel: 'gpt-4o', displayName: 'GPT-4o (Default)' },
   ],
   authStrategies: [
-    { type: 'cli', cliCommand: 'codex' },
     { type: 'api', envVar: 'OPENAI_API_KEY' },
+    { type: 'oauth' }, // OAuth from Codex CLI credentials
   ],
   defaultVariant: 'default',
 };
@@ -47,7 +48,8 @@ const CODEX_DEFINITION: ProviderDefinition = {
     { id: 'default', apiModel: 'gpt-4o', displayName: 'Codex Default' },
   ],
   authStrategies: [
-    { type: 'cli', cliCommand: 'codex' },
+    { type: 'api', envVar: 'OPENAI_API_KEY' },
+    { type: 'oauth' },
   ],
   defaultVariant: 'default',
 };
@@ -55,20 +57,58 @@ const CODEX_DEFINITION: ProviderDefinition = {
 export class OpenAIProvider extends ModelProvider {
   readonly definition: ProviderDefinition;
   private isCodexAlias: boolean;
+  private apiClient: OpenAI | null = null;
+  private oauthClient: OpenAI | null = null;
   private oauthCredentials: OAuthCredentials | null = null;
 
   constructor(
     variant: string = 'default',
-    authType: AuthType = 'cli',
+    authType: AuthType = 'api',
     timeout?: number,
     isCodexAlias: boolean = false
   ) {
     super(variant, authType, timeout);
     this.isCodexAlias = isCodexAlias;
     this.definition = isCodexAlias ? CODEX_DEFINITION : OPENAI_DEFINITION;
-    
-    // Try to read OAuth credentials from Codex CLI
+    this.initializeClients();
+  }
+
+  /**
+   * Initialize API clients based on available credentials
+   */
+  private initializeClients(): void {
+    // Try API key first
+    if (process.env.OPENAI_API_KEY) {
+      try {
+        this.apiClient = new OpenAI();
+      } catch {
+        // Ignore initialization errors
+      }
+    }
+
+    // Try OAuth credentials from Codex CLI
     this.oauthCredentials = readCodexCredentials();
+    if (this.oauthCredentials && !isExpired(this.oauthCredentials)) {
+      try {
+        this.oauthClient = new OpenAI({
+          apiKey: this.oauthCredentials.access,
+        });
+      } catch {
+        // Ignore initialization errors
+      }
+    }
+  }
+
+  /**
+   * Get the best available client (prefers OAuth for subscription users)
+   */
+  private getClient(): OpenAI | null {
+    // Prefer OAuth client (subscription users)
+    if (this.oauthClient && this.oauthCredentials && !isExpired(this.oauthCredentials)) {
+      return this.oauthClient;
+    }
+    // Fall back to API key client
+    return this.apiClient;
   }
 
   protected getDefinition(): ProviderDefinition {
@@ -80,25 +120,23 @@ export class OpenAIProvider extends ModelProvider {
    */
   async checkAvailable(): Promise<boolean> {
     // Check OAuth credentials first
-    if (this.oauthCredentials && !isExpired(this.oauthCredentials)) {
+    if (this.oauthClient && this.oauthCredentials && !isExpired(this.oauthCredentials)) {
       return true;
     }
 
     // Check API key
-    if (process.env.OPENAI_API_KEY) {
+    if (this.apiClient && process.env.OPENAI_API_KEY) {
       return true;
-    }
-
-    // Fall back to CLI check
-    if (this.authType === 'cli') {
-      return this.checkCliAvailable('codex');
     }
 
     return false;
   }
 
   /**
-   * Run as a coding agent using Codex CLI
+   * Run as a coding agent using SDK with tool calling
+   * 
+   * This is the new SDK-based implementation that replaces CLI spawning.
+   * The agent loop handles tool calling natively through the OpenAI SDK.
    */
   async runAsAgent(
     task: string,
@@ -107,60 +145,73 @@ export class OpenAIProvider extends ModelProvider {
     baseCommit?: string
   ): Promise<AgentResult> {
     const startTime = Date.now();
-    const prompt = this.buildAgentPrompt(task);
+    const client = this.getClient();
 
-    // Use Codex CLI for agent tasks (has tools, file access)
-    const { stdout, stderr, code } = await this.execCli(
-      'codex',
-      ['--approval-mode', 'full-auto', '--quiet', prompt],
-      worktreePath
-    );
+    if (!client) {
+      return this.createAgentResult(
+        this.name,
+        worktreePath,
+        branchName,
+        baseCommit,
+        {
+          output: '',
+          error: 'No OpenAI credentials available. Set OPENAI_API_KEY or authenticate with Codex CLI.',
+          success: false,
+          durationMs: Date.now() - startTime,
+        }
+      );
+    }
 
-    return this.createAgentResult(
-      this.name,
-      worktreePath,
-      branchName,
-      baseCommit,
-      {
-        output: stdout,
-        error: stderr || undefined,
-        success: code === 0,
-        durationMs: Date.now() - startTime,
-      }
-    );
+    try {
+      const result = await runAgentLoop({
+        provider: 'openai',
+        model: this.variant.apiModel || 'gpt-4o',
+        task,
+        workdir: worktreePath,
+        maxIterations: 30,
+        verbose: false,
+        openaiClient: client,
+      });
+
+      return this.createAgentResult(
+        this.name,
+        worktreePath,
+        branchName,
+        baseCommit,
+        {
+          output: result.output,
+          error: result.error,
+          success: result.success,
+          durationMs: Date.now() - startTime,
+        }
+      );
+    } catch (err: any) {
+      return this.createAgentResult(
+        this.name,
+        worktreePath,
+        branchName,
+        baseCommit,
+        {
+          output: '',
+          error: err.message || String(err),
+          success: false,
+          durationMs: Date.now() - startTime,
+        }
+      );
+    }
   }
 
   /**
-   * Run as synthesizer
+   * Run as synthesizer (for analyzing agent outputs)
    * 
-   * ALWAYS uses SDK to avoid CLI hanging issues.
+   * Uses SDK for simple prompt → response (no tools needed).
    */
   async runAsSynthesizer(prompt: string): Promise<ModelResponse> {
-    // Try OAuth credentials first
-    if (this.oauthCredentials && !isExpired(this.oauthCredentials)) {
-      return this.synthesizeViaApi(prompt, this.oauthCredentials.access);
-    }
-
-    // Try API key
-    if (process.env.OPENAI_API_KEY) {
-      return this.synthesizeViaApi(prompt);
-    }
-
-    // No SDK credentials available - fall back to CLI (may hang)
-    console.warn('[openai] No OAuth/API credentials found, falling back to CLI');
-    return this.synthesizeViaCli(prompt);
-  }
-
-  /**
-   * Synthesize using OpenAI API
-   */
-  private async synthesizeViaApi(prompt: string, oauthToken?: string): Promise<ModelResponse> {
-    // Dynamic import to avoid requiring openai package if not using API
-    const { default: OpenAI } = await import('openai');
+    const client = this.getClient();
     
-    const client = oauthToken 
-      ? new OpenAI({ apiKey: oauthToken })
-      : new OpenAI();
+    if (!client) {
+      throw new Error('No OpenAI credentials available. Set OPENAI_API_KEY or authenticate with Codex CLI.');
+    }
 
     const response = await client.chat.completions.create({
       model: this.variant.apiModel || 'gpt-4o',
@@ -179,49 +230,6 @@ export class OpenAIProvider extends ModelProvider {
         outputTokens: response.usage?.completion_tokens || 0,
       },
     };
-  }
-
-  /**
-   * Synthesize using Codex CLI (fallback)
-   */
-  private async synthesizeViaCli(prompt: string): Promise<ModelResponse> {
-    return new Promise((resolve, reject) => {
-      let output = '';
-      let errorOutput = '';
-
-      // Use codex in quiet mode for synthesis
-      const proc = spawn('codex', ['--quiet', prompt], {
-        stdio: 'pipe',
-        env: process.env,
-      });
-
-      proc.stdout?.on('data', (data) => {
-        output += data.toString();
-      });
-
-      proc.stderr?.on('data', (data) => {
-        errorOutput += data.toString();
-      });
-
-      const timeout = setTimeout(() => {
-        proc.kill('SIGTERM');
-        reject(new Error('Codex CLI synthesis timed out'));
-      }, this.timeout);
-
-      proc.on('close', (code) => {
-        clearTimeout(timeout);
-        if (code === 0) {
-          resolve({ content: output.trim() });
-        } else {
-          reject(new Error(`Codex CLI exited with code ${code}: ${errorOutput}`));
-        }
-      });
-
-      proc.on('error', (err) => {
-        clearTimeout(timeout);
-        reject(new Error(`Failed to spawn Codex CLI: ${err.message}`));
-      });
-    });
   }
 }
 

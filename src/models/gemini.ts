@@ -1,15 +1,15 @@
 /**
- * Gemini provider implementation
+ * Gemini provider implementation - SDK-based
+ * 
+ * Uses Google AI SDK for both agent tasks and synthesis.
+ * No more CLI spawning for agent tasks - full SDK control.
  * 
  * Supports:
  * - OAuth auth: Uses OAuth token from Gemini CLI credentials (if available)
  * - API auth: Uses Google AI SDK with GEMINI_API_KEY or GOOGLE_API_KEY
- * - CLI auth: Falls back to spawning `gemini` CLI
- * 
- * For synthesis, ALWAYS uses SDK when credentials are available.
  */
 
-import { spawn } from 'node:child_process';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import { ModelProvider, ProviderRegistry } from './provider.js';
 import {
   AuthType,
@@ -23,6 +23,7 @@ import {
   Credentials,
   getAccessToken,
 } from '../auth/index.js';
+import { runAgentLoop } from '../agent-loop.js';
 
 const GEMINI_DEFINITION: ProviderDefinition = {
   name: 'gemini',
@@ -33,8 +34,8 @@ const GEMINI_DEFINITION: ProviderDefinition = {
     { id: 'default', apiModel: 'gemini-2.0-flash', displayName: 'Gemini 2.0 Flash (Default)' },
   ],
   authStrategies: [
-    { type: 'cli', cliCommand: 'gemini' },
     { type: 'api', envVar: 'GEMINI_API_KEY' },
+    { type: 'oauth' }, // OAuth from Gemini CLI credentials (if available)
   ],
   defaultVariant: 'default',
 };
@@ -42,12 +43,43 @@ const GEMINI_DEFINITION: ProviderDefinition = {
 export class GeminiProvider extends ModelProvider {
   readonly definition = GEMINI_DEFINITION;
   private oauthCredentials: Credentials | null = null;
+  private apiKey: string | null = null;
 
-  constructor(variant: string = 'default', authType: AuthType = 'cli', timeout?: number) {
+  constructor(variant: string = 'default', authType: AuthType = 'api', timeout?: number) {
     super(variant, authType, timeout);
-    
-    // Try to read OAuth credentials from Gemini CLI
+    this.initializeCredentials();
+  }
+
+  /**
+   * Initialize credentials
+   */
+  private initializeCredentials(): void {
+    // Try OAuth credentials from Gemini CLI
     this.oauthCredentials = readGeminiCredentials();
+    
+    // Try API key from environment
+    this.apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || null;
+  }
+
+  /**
+   * Get the API key to use (OAuth token or env var)
+   */
+  private getApiKey(): string | null {
+    // Prefer OAuth credentials
+    if (this.oauthCredentials && !isExpired(this.oauthCredentials)) {
+      return getAccessToken(this.oauthCredentials);
+    }
+    // Fall back to env var
+    return this.apiKey;
+  }
+
+  /**
+   * Get a configured Gemini client
+   */
+  private getClient(): GoogleGenerativeAI | null {
+    const apiKey = this.getApiKey();
+    if (!apiKey) return null;
+    return new GoogleGenerativeAI(apiKey);
   }
 
   protected getDefinition(): ProviderDefinition {
@@ -64,20 +96,18 @@ export class GeminiProvider extends ModelProvider {
     }
 
     // Check API keys
-    if (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY) {
+    if (this.apiKey) {
       return true;
-    }
-
-    // Fall back to CLI check
-    if (this.authType === 'cli') {
-      return this.checkCliAvailable('gemini');
     }
 
     return false;
   }
 
   /**
-   * Run as a coding agent using Gemini CLI
+   * Run as a coding agent using SDK with tool calling
+   * 
+   * This is the new SDK-based implementation that replaces CLI spawning.
+   * The agent loop handles tool calling natively through the Google AI SDK.
    */
   async runAsAgent(
     task: string,
@@ -86,61 +116,77 @@ export class GeminiProvider extends ModelProvider {
     baseCommit?: string
   ): Promise<AgentResult> {
     const startTime = Date.now();
-    const prompt = this.buildAgentPrompt(task);
+    const client = this.getClient();
 
-    // Use Gemini CLI for agent tasks (has tools, file access)
-    const { stdout, stderr, code } = await this.execCli(
-      'gemini',
-      ['--prompt', prompt, '--sandbox', 'false'],
-      worktreePath
-    );
+    if (!client) {
+      return this.createAgentResult(
+        this.name,
+        worktreePath,
+        branchName,
+        baseCommit,
+        {
+          output: '',
+          error: 'No Gemini credentials available. Set GEMINI_API_KEY or GOOGLE_API_KEY.',
+          success: false,
+          durationMs: Date.now() - startTime,
+        }
+      );
+    }
 
-    return this.createAgentResult(
-      this.name,
-      worktreePath,
-      branchName,
-      baseCommit,
-      {
-        output: stdout,
-        error: stderr || undefined,
-        success: code === 0,
-        durationMs: Date.now() - startTime,
-      }
-    );
+    try {
+      const result = await runAgentLoop({
+        provider: 'gemini',
+        model: this.variant.apiModel || 'gemini-2.0-flash',
+        task,
+        workdir: worktreePath,
+        maxIterations: 30,
+        verbose: false,
+        geminiClient: client,
+      });
+
+      return this.createAgentResult(
+        this.name,
+        worktreePath,
+        branchName,
+        baseCommit,
+        {
+          output: result.output,
+          error: result.error,
+          success: result.success,
+          durationMs: Date.now() - startTime,
+        }
+      );
+    } catch (err: any) {
+      return this.createAgentResult(
+        this.name,
+        worktreePath,
+        branchName,
+        baseCommit,
+        {
+          output: '',
+          error: err.message || String(err),
+          success: false,
+          durationMs: Date.now() - startTime,
+        }
+      );
+    }
   }
 
   /**
-   * Run as synthesizer
+   * Run as synthesizer (for analyzing agent outputs)
    * 
-   * ALWAYS uses SDK when credentials are available.
+   * Uses SDK for simple prompt → response (no tools needed).
    */
   async runAsSynthesizer(prompt: string): Promise<ModelResponse> {
-    // Try OAuth credentials first
-    if (this.oauthCredentials && !isExpired(this.oauthCredentials)) {
-      const token = getAccessToken(this.oauthCredentials);
-      return this.synthesizeViaApi(prompt, token);
-    }
-
-    // Try API keys
-    const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
-    if (apiKey) {
-      return this.synthesizeViaApi(prompt, apiKey);
-    }
-
-    // No SDK credentials available - fall back to CLI
-    console.warn('[gemini] No OAuth/API credentials found, falling back to CLI');
-    return this.synthesizeViaCli(prompt);
-  }
-
-  /**
-   * Synthesize using Google AI API
-   */
-  private async synthesizeViaApi(prompt: string, apiKey: string): Promise<ModelResponse> {
-    // Dynamic import to avoid requiring @google/generative-ai if not using API
-    const { GoogleGenerativeAI } = await import('@google/generative-ai');
+    const client = this.getClient();
     
-    const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({ model: this.variant.apiModel || 'gemini-2.0-flash' });
+    if (!client) {
+      throw new Error('No Gemini credentials available. Set GEMINI_API_KEY or GOOGLE_API_KEY.');
+    }
+
+    const model = client.getGenerativeModel({ 
+      model: this.variant.apiModel || 'gemini-2.0-flash' 
+    });
 
     const result = await model.generateContent(prompt);
     const response = result.response;
@@ -153,49 +199,6 @@ export class GeminiProvider extends ModelProvider {
         outputTokens: response.usageMetadata?.candidatesTokenCount || 0,
       },
     };
-  }
-
-  /**
-   * Synthesize using Gemini CLI (fallback)
-   */
-  private async synthesizeViaCli(prompt: string): Promise<ModelResponse> {
-    return new Promise((resolve, reject) => {
-      let output = '';
-      let errorOutput = '';
-
-      // Use gemini CLI with prompt flag
-      const proc = spawn('gemini', ['--prompt', prompt], {
-        stdio: 'pipe',
-        env: process.env,
-      });
-
-      proc.stdout?.on('data', (data) => {
-        output += data.toString();
-      });
-
-      proc.stderr?.on('data', (data) => {
-        errorOutput += data.toString();
-      });
-
-      const timeout = setTimeout(() => {
-        proc.kill('SIGTERM');
-        reject(new Error('Gemini CLI synthesis timed out'));
-      }, this.timeout);
-
-      proc.on('close', (code) => {
-        clearTimeout(timeout);
-        if (code === 0) {
-          resolve({ content: output.trim() });
-        } else {
-          reject(new Error(`Gemini CLI exited with code ${code}: ${errorOutput}`));
-        }
-      });
-
-      proc.on('error', (err) => {
-        clearTimeout(timeout);
-        reject(new Error(`Failed to spawn Gemini CLI: ${err.message}`));
-      });
-    });
   }
 }
 

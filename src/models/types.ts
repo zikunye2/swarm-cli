@@ -1,22 +1,24 @@
 /**
  * Types for the flexible model/auth architecture
  * 
+ * Now SDK-only - no more CLI spawning for agent tasks.
+ * 
  * Supports multiple auth strategies per provider:
  * - API: Uses SDK with env var (e.g., ANTHROPIC_API_KEY)
- * - CLI: Spawns the provider's CLI tool (e.g., claude, gemini, codex)
+ * - OAuth: Uses OAuth token from CLI credentials (subscription users)
  */
 
 // Authentication strategies
 // - 'oauth': Uses OAuth token from CLI credentials (subscription users)
 // - 'api': Uses SDK with env var (e.g., ANTHROPIC_API_KEY)
-// - 'cli': Spawns the provider's CLI tool (e.g., claude, gemini, codex) - may hang on M1 Macs
+// Note: 'cli' is deprecated - all providers now use SDK with tool calling
 export type AuthType = 'oauth' | 'api' | 'cli';
 
 export interface AuthStrategy {
   type: AuthType;
   // For API auth: the env var name (e.g., 'ANTHROPIC_API_KEY')
   envVar?: string;
-  // For CLI auth: the command to run (e.g., 'claude')
+  // For CLI auth (deprecated): the command to run
   cliCommand?: string;
 }
 
@@ -62,17 +64,17 @@ export const DEFAULT_CONFIG: SwarmConfig = {
   defaultSynthesizer: 'claude:sonnet',
   providers: {
     claude: {
-      auth: 'cli',
+      auth: 'api',  // Changed from 'cli' - SDK is now default
       apiKey: 'ANTHROPIC_API_KEY',
       defaultVariant: 'sonnet',
     },
     openai: {
-      auth: 'cli',
+      auth: 'api',  // Changed from 'cli' - SDK is now default
       apiKey: 'OPENAI_API_KEY',
       defaultVariant: 'default',
     },
     gemini: {
-      auth: 'cli',
+      auth: 'api',  // Changed from 'cli' - SDK is now default
       apiKey: 'GEMINI_API_KEY',
       defaultVariant: 'pro',
     },
