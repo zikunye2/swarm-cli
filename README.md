@@ -236,7 +236,7 @@ Run `swarm --init` to create a default config file.
 |--------|------|-------------|
 | `defaultAgents` | `string[]` | Default agents to use when none specified |
 | `defaultSynthesizer` | `string` | Default model for synthesis |
-| `providers.<name>.auth` | `"cli"` or `"api"` | Authentication method |
+| `providers.<name>.auth` | `"oauth"`, `"cli"`, or `"api"` | Authentication method |
 | `providers.<name>.apiKey` | `string` | Environment variable name for API key |
 | `providers.<name>.defaultVariant` | `string` | Default variant for this provider |
 
@@ -252,15 +252,28 @@ Run `swarm --init` to create a default config file.
 
 ### Auth Modes
 
+**OAuth Auth (Recommended for Subscription Users)**
+- Automatically reads OAuth tokens from CLI credential stores
+- Claude: reads from macOS Keychain (`Claude Code-credentials`) or `~/.claude/.credentials.json`
+- Codex: reads from macOS Keychain (`Codex Auth`) or `~/.codex/auth.json`
+- Uses SDK directly with OAuth token — avoids CLI hanging issues on M1 Macs
+- Best for synthesis operations (no CLI spawn required)
+
 **CLI Auth (Default)**
 - Uses the provider's installed CLI tool
 - Requires subscription to the CLI service
 - No API key needed
+- ⚠️ May hang on macOS M1 in some cases
 
 **API Auth**
 - Uses the provider's API directly
 - Requires API key in environment
 - May have different rate limits/costs
+
+**Auth Priority:**
+1. OAuth token from CLI credentials (subscription users)
+2. API key from environment variable (API users)
+3. CLI fallback (spawns CLI tool)
 
 ## Decision Logging
 
@@ -317,6 +330,9 @@ swarm-cli/
 │   ├── logging.ts       # Session logging (SWARM_LOG.md)
 │   ├── applier.ts       # Apply changes to main branch
 │   ├── types.ts         # Shared types
+│   ├── auth/            # OAuth credential reading
+│   │   ├── credentials.ts # Keychain/file credential readers
+│   │   └── index.ts     # Module exports
 │   ├── models/          # Flexible model/auth system
 │   │   ├── types.ts     # Model & auth types
 │   │   ├── provider.ts  # Abstract provider base
@@ -384,6 +400,12 @@ See existing providers for reference implementation.
 - Check that synthesizer model is available
 - Try a different synthesizer: `--synthesizer claude:sonnet`
 - Synthesis failures will show raw diffs as fallback
+
+### CLI hanging on macOS M1
+- swarm-cli now automatically uses OAuth tokens when available
+- Ensure you've logged into the CLI at least once (`claude login`, `codex auth login`)
+- OAuth tokens are read from keychain/credential files automatically
+- Set API keys as fallback: `export ANTHROPIC_API_KEY="sk-..."`
 
 ### Ctrl+C not cleaning up
 - Press Ctrl+C once for graceful shutdown
