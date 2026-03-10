@@ -3,25 +3,33 @@
 /**
  * swarm-cli - Multi-Agent Deliberation CLI
  * 
- * Phase 2: Multi-agent support with parallel execution
+ * Runs coding tasks across multiple AI CLI agents in parallel,
+ * then synthesizes conflicts for human decision.
+ * 
+ * Supports flexible model selection with provider:variant syntax
+ * and multiple auth strategies (CLI or API).
  */
 
 import { Orchestrator } from './orchestrator.js';
 import { Synthesizer } from './synthesizer.js';
 import { SynthesisResult } from './types.js';
+import { loadConfig, mergeWithCliOptions, getConfigPath, validateModelSpec } from './config.js';
+import { ProviderRegistry, listAllModels, isValidModelSpec } from './models/index.js';
 import path from 'node:path';
 
 interface CliArgs {
   task: string;
   agents: string[];
+  synthesizer: string;
   repoPath: string;
   verbose: boolean;
   outputFormat: 'json' | 'text';
   cleanup: boolean;
-  listAgents: boolean;
+  listModels: boolean;
+  initConfig: boolean;
 }
 
-function parseArgs(): CliArgs {
+async function parseArgs(): Promise<CliArgs> {
   const args = process.argv.slice(2);
   
   if (args.length === 0 || args.includes('--help') || args.includes('-h')) {
@@ -29,26 +37,47 @@ function parseArgs(): CliArgs {
     process.exit(0);
   }
 
-  if (args.includes('--list-agents')) {
+  if (args.includes('--list-models') || args.includes('--list-agents')) {
     return {
       task: '',
       agents: [],
+      synthesizer: '',
       repoPath: process.cwd(),
       verbose: false,
       outputFormat: 'text',
       cleanup: true,
-      listAgents: true,
+      listModels: true,
+      initConfig: false,
     };
   }
 
+  if (args.includes('--init')) {
+    return {
+      task: '',
+      agents: [],
+      synthesizer: '',
+      repoPath: process.cwd(),
+      verbose: false,
+      outputFormat: 'text',
+      cleanup: true,
+      listModels: false,
+      initConfig: true,
+    };
+  }
+
+  // Load config first
+  const config = await loadConfig();
+
   const result: CliArgs = {
     task: '',
-    agents: ['claude'], // Default to Claude agent
+    agents: config.defaultAgents,
+    synthesizer: config.defaultSynthesizer,
     repoPath: process.cwd(),
     verbose: false,
     outputFormat: 'text',
     cleanup: true,
-    listAgents: false,
+    listModels: false,
+    initConfig: false,
   };
 
   let i = 0;
@@ -56,10 +85,12 @@ function parseArgs(): CliArgs {
     const arg = args[i];
     
     if (arg === '--agents' || arg === '-a') {
-      const agentArg = args[++i];
-      // Handle empty string or missing value - fallback to default
-      const parsedAgents = agentArg?.split(',').filter(a => a.trim() !== '');
-      result.agents = parsedAgents && parsedAgents.length > 0 ? parsedAgents : ['claude'];
+      const agentList = args[++i];
+      if (agentList) {
+        result.agents = agentList.split(',').map(s => s.trim());
+      }
+    } else if (arg === '--synthesizer' || arg === '-s') {
+      result.synthesizer = args[++i] || config.defaultSynthesizer;
     } else if (arg === '--repo' || arg === '-r') {
       result.repoPath = args[++i] || process.cwd();
     } else if (arg === '--verbose' || arg === '-v') {
@@ -80,11 +111,27 @@ function parseArgs(): CliArgs {
     process.exit(1);
   }
 
+  // Validate model specs
+  for (const agent of result.agents) {
+    const validation = validateModelSpec(agent);
+    if (!validation.valid) {
+      console.error(`Error: ${validation.error}`);
+      process.exit(1);
+    }
+  }
+
+  const synthValidation = validateModelSpec(result.synthesizer);
+  if (!synthValidation.valid) {
+    console.error(`Error: ${synthValidation.error}`);
+    process.exit(1);
+  }
+
   return result;
 }
 
 function printHelp(): void {
-  const availableAgents = Orchestrator.getAvailableAgents().join(', ');
+  const availableModels = listAllModels().join(', ');
+  const providers = ProviderRegistry.list().join(', ');
   
   console.log(`
 swarm - Multi-Agent Deliberation CLI
@@ -92,52 +139,91 @@ swarm - Multi-Agent Deliberation CLI
 Usage: swarm <task> [options]
 
 Arguments:
-  task                    The coding task to execute (required)
+  task                       The coding task to execute (required)
 
 Options:
-  -a, --agents <list>     Comma-separated list of agents (default: claude)
-                          Available: ${availableAgents}
-  -r, --repo <path>       Repository path (default: current directory)
-  -v, --verbose           Enable verbose output
-  --json                  Output synthesis as JSON
-  --no-cleanup            Don't cleanup worktrees after execution
-  --list-agents           Show available agents and their status
-  -h, --help              Show this help message
+  -a, --agents <list>        Comma-separated list of agents/models
+                             Format: provider:variant (e.g., claude:opus, gemini:pro)
+                             Default: from config or 'claude'
+                             
+  -s, --synthesizer <model>  Model to use for synthesis
+                             Format: provider:variant (e.g., claude:sonnet)
+                             Default: from config or 'claude:sonnet'
+                             
+  -r, --repo <path>          Repository path (default: current directory)
+  -v, --verbose              Enable verbose output
+  --json                     Output synthesis as JSON
+  --no-cleanup               Don't cleanup worktrees after execution
+  --list-models              Show available models and their status
+  --init                     Create default config file
+  -h, --help                 Show this help message
+
+Available Providers: ${providers}
+Available Models: ${availableModels}
 
 Examples:
   swarm "add input validation to user forms"
-  swarm "refactor the authentication module" --agents claude,codex,gemini
-  swarm "add unit tests" --verbose --json
-  swarm "fix bug" --agents claude,gemini
+  swarm "refactor auth" --agents claude:opus,gemini:pro
+  swarm "add tests" --agents claude:sonnet,codex --synthesizer claude:opus
+  swarm "fix bug" --verbose --json
 
-Multi-Agent Mode:
-  Run multiple AI agents in parallel on the same task. Each agent works
-  in an isolated git worktree. After completion, swarm analyzes the
-  outputs and identifies conflicts between approaches.
+Configuration:
+  Config file: ~/.swarm/config.json
+  
+  The config file can set defaults for agents, synthesizer, and auth methods.
+  Run 'swarm --init' to create a default config file.
+  
+  Environment variables:
+    ANTHROPIC_API_KEY    - For Claude API auth
+    OPENAI_API_KEY       - For OpenAI/Codex API auth  
+    GEMINI_API_KEY       - For Gemini API auth
+    SWARM_AGENTS         - Override default agents
+    SWARM_SYNTHESIZER    - Override default synthesizer
 
-Environment:
-  ANTHROPIC_API_KEY       Optional - for direct API synthesis
-                          (Falls back to 'claude' CLI if not set)
+Auth Modes:
+  Each provider supports CLI auth (subscription-based, no API key needed)
+  or API auth (requires API key). The tool auto-detects based on available
+  API keys, or you can configure in ~/.swarm/config.json.
 `);
 }
 
-async function listAgents(): Promise<void> {
-  console.log('\n🤖 Available Agents:\n');
+async function listModels(): Promise<void> {
+  console.log('\n🤖 Available Models:\n');
   
-  const agents = Orchestrator.getAvailableAgents();
+  const providers = ProviderRegistry.list();
   
-  for (const agentName of agents) {
-    // Create a temporary orchestrator to check availability
-    const tempOrch = new Orchestrator({ repoPath: process.cwd() });
-    tempOrch.addAgent(agentName);
+  for (const providerName of providers) {
+    const def = ProviderRegistry.getDefinition(providerName);
+    if (!def) continue;
     
-    // We can't easily check without exposing it, but we can try to instantiate
-    // For now, just list them
-    console.log(`  • ${agentName}`);
+    console.log(`📦 ${def.displayName} (${def.name})`);
+    
+    // Check availability
+    const provider = ProviderRegistry.get(providerName);
+    const available = provider ? await provider.checkAvailable() : false;
+    const statusIcon = available ? '✅' : '⚫';
+    
+    console.log(`   Status: ${statusIcon} ${available ? 'Available' : 'Not available'}`);
+    console.log(`   Auth: ${def.authStrategies.map(s => s.type).join(', ')}`);
+    console.log(`   Variants:`);
+    
+    for (const variant of def.variants) {
+      const isDefault = variant.id === def.defaultVariant;
+      console.log(`     • ${providerName}:${variant.id} - ${variant.displayName}${isDefault ? ' (default)' : ''}`);
+    }
+    console.log('');
   }
   
-  console.log(`\nUse --agents <name1,name2,...> to specify which agents to use.`);
-  console.log(`Example: swarm "fix bug" --agents claude,codex,gemini\n`);
+  console.log(`Config file: ${getConfigPath()}`);
+  console.log(`\nUse --agents <model1,model2,...> to specify which models to use.`);
+  console.log(`Example: swarm "fix bug" --agents claude:opus,gemini:pro --synthesizer claude:sonnet\n`);
+}
+
+async function initConfigFile(): Promise<void> {
+  const { initConfig } = await import('./config.js');
+  await initConfig();
+  console.log(`\nConfig initialized at ${getConfigPath()}`);
+  console.log('Edit this file to customize default agents, synthesizer, and auth methods.');
 }
 
 function formatTextOutput(synthesis: SynthesisResult): string {
@@ -252,29 +338,35 @@ function formatTextOutput(synthesis: SynthesisResult): string {
 }
 
 async function main(): Promise<void> {
-  const args = parseArgs();
+  const args = await parseArgs();
 
-  // Handle --list-agents
-  if (args.listAgents) {
-    await listAgents();
+  // Handle --list-models
+  if (args.listModels) {
+    await listModels();
     return;
   }
 
-  // Check synthesis availability (either API key or Claude CLI)
-  const hasApiKey = !!process.env.ANTHROPIC_API_KEY;
-  const hasClaudeCli = await Synthesizer.isClaudeCliAvailable();
+  // Handle --init
+  if (args.initConfig) {
+    await initConfigFile();
+    return;
+  }
+
+  // Check synthesis availability
+  const synthAvailable = await Synthesizer.isAvailable(args.synthesizer);
   
-  if (!hasApiKey && !hasClaudeCli) {
-    console.error('Error: No synthesis method available.');
-    console.error('Either set ANTHROPIC_API_KEY or install the Claude CLI.');
+  if (!synthAvailable) {
+    console.error(`Error: Synthesizer model '${args.synthesizer}' is not available.`);
+    console.error('Check that the required CLI is installed or API key is set.');
+    console.error('Run "swarm --list-models" to see available models.');
     process.exit(1);
   }
 
   console.log(`\n🐝 SWARM starting...`);
   console.log(`Task: "${args.task}"`);
   console.log(`Agents: ${args.agents.join(', ')}`);
+  console.log(`Synthesizer: ${args.synthesizer}`);
   console.log(`Repo: ${path.resolve(args.repoPath)}`);
-  console.log(`Synthesis: ${hasApiKey ? 'Anthropic API' : 'Claude CLI'}`);
   console.log('');
 
   // Initialize orchestrator
@@ -285,7 +377,7 @@ async function main(): Promise<void> {
 
   // Add agents
   try {
-    orchestrator.addAgents(args.agents);
+    await orchestrator.addAgents(args.agents);
   } catch (err) {
     console.error(`Error: ${(err as Error).message}`);
     process.exit(1);
@@ -304,7 +396,10 @@ async function main(): Promise<void> {
     if (results.length > 0) {
       // Synthesize results
       console.log('🔬 Synthesizing results...');
-      const synthesizer = new Synthesizer({ verbose: args.verbose });
+      const synthesizer = new Synthesizer({ 
+        model: args.synthesizer,
+        verbose: args.verbose 
+      });
       const synthesis = await synthesizer.synthesize(args.task, results);
 
       // Output results

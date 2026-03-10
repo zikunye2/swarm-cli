@@ -1,17 +1,19 @@
 /**
  * Orchestrator - manages parallel agent execution with progress display
+ * 
+ * Now uses the flexible model system to support multiple providers
+ * with different auth strategies.
  */
 
 import { WorktreeManager } from './worktree.js';
-import { Agent, AgentRegistry } from './agents/base.js';
-import { AgentResult, TaskConfig } from './types.js';
-import { simpleGit } from 'simple-git';
-
-// Import agents to trigger their registration via module side effects
-// The import itself executes the registration code at module load time
-import './agents/claude.js';
-import './agents/codex.js';
-import './agents/gemini.js';
+import { AgentResult } from './types.js';
+import { 
+  ModelProvider, 
+  ProviderRegistry, 
+  getProvider, 
+  AuthType 
+} from './models/index.js';
+import { loadConfig, getEffectiveAuth } from './config.js';
 
 export interface OrchestratorOptions {
   repoPath: string;
@@ -28,10 +30,15 @@ interface AgentProgress {
   error?: string;
 }
 
+interface AgentEntry {
+  modelSpec: string;  // e.g., 'claude:opus', 'gemini:pro'
+  provider: ModelProvider;
+}
+
 export class Orchestrator {
   private worktreeManager: WorktreeManager;
   private options: OrchestratorOptions;
-  private agents: Agent[] = [];
+  private agents: AgentEntry[] = [];
   private progress: Map<string, AgentProgress> = new Map();
   private progressInterval?: NodeJS.Timeout;
 
@@ -46,59 +53,30 @@ export class Orchestrator {
   }
 
   /**
-   * Validate that the current directory is a git repository and is clean
+   * Add an agent by model spec (e.g., 'claude:opus', 'gemini', 'codex')
    */
-  async validateRepository(): Promise<void> {
-    const git = simpleGit(this.options.repoPath);
-
-    // Check if this is a git repository
-    const isRepo = await git.checkIsRepo();
-    if (!isRepo) {
-      throw new Error(`Not a git repository: ${this.options.repoPath}`);
-    }
-
-    // Check for uncommitted changes
-    const status = await git.status();
-    const hasUncommittedChanges = 
-      status.modified.length > 0 ||
-      status.staged.length > 0 ||
-      status.created.length > 0 ||
-      status.deleted.length > 0 ||
-      status.renamed.length > 0;
-
-    if (hasUncommittedChanges) {
-      const changedFiles = [
-        ...status.modified,
-        ...status.staged,
-        ...status.created,
-        ...status.deleted,
-        ...status.renamed.map((r: { to: string }) => r.to),
-      ];
+  async addAgent(modelSpec: string, authType?: AuthType): Promise<void> {
+    const config = await loadConfig();
+    const providerName = modelSpec.split(':')[0];
+    const effectiveAuth = authType || getEffectiveAuth(config, providerName);
+    
+    const provider = getProvider(modelSpec, effectiveAuth);
+    if (!provider) {
       throw new Error(
-        `Repository has uncommitted changes. Please commit or stash them first.\n` +
-        `Changed files: ${changedFiles.slice(0, 5).join(', ')}${changedFiles.length > 5 ? ` (+${changedFiles.length - 5} more)` : ''}`
+        `Unknown model: ${modelSpec}. Available: ${ProviderRegistry.list().join(', ')}`
       );
     }
+    
+    this.agents.push({ modelSpec, provider });
+    this.progress.set(provider.name, { agentName: provider.name, status: 'pending' });
   }
 
   /**
-   * Add an agent to the orchestration
+   * Add multiple agents by model spec
    */
-  addAgent(agentName: string): void {
-    const agent = AgentRegistry.get(agentName);
-    if (!agent) {
-      throw new Error(`Unknown agent: ${agentName}. Available: ${AgentRegistry.list().join(', ')}`);
-    }
-    this.agents.push(agent);
-    this.progress.set(agentName, { agentName, status: 'pending' });
-  }
-
-  /**
-   * Add multiple agents
-   */
-  addAgents(agentNames: string[]): void {
-    for (const name of agentNames) {
-      this.addAgent(name);
+  async addAgents(modelSpecs: string[]): Promise<void> {
+    for (const spec of modelSpecs) {
+      await this.addAgent(spec);
     }
   }
 
@@ -110,9 +88,6 @@ export class Orchestrator {
       throw new Error('No agents configured. Add at least one agent before executing.');
     }
 
-    // Validate git repository before starting
-    await this.validateRepository();
-
     this.log(`Starting parallel execution with ${this.agents.length} agent(s)...`);
     this.log(`Task: "${task}"`);
 
@@ -120,19 +95,19 @@ export class Orchestrator {
     const availableAgents = await this.checkAgentAvailability();
     
     if (availableAgents.length === 0) {
-      throw new Error('No agents are available. Please install at least one agent CLI.');
+      throw new Error('No agents are available. Please install at least one agent CLI or set API keys.');
     }
 
     // Create worktrees for each available agent
     this.log('Creating worktrees...');
     const worktrees = await Promise.all(
-      availableAgents.map(async (agent) => {
+      availableAgents.map(async (entry) => {
         const worktree = await this.worktreeManager.createWorktree(
-          agent.name,
+          entry.provider.name,
           this.options.baseBranch
         );
-        this.log(`  Created worktree for ${agent.name}: ${worktree.path}`);
-        return { agent, worktree };
+        this.log(`  Created worktree for ${entry.provider.name}: ${worktree.path}`);
+        return { entry, worktree };
       })
     );
 
@@ -144,20 +119,23 @@ export class Orchestrator {
     const startTime = Date.now();
 
     const results = await Promise.all(
-      worktrees.map(async ({ agent, worktree }) => {
-        this.updateProgress(agent.name, { status: 'running', startTime: Date.now() });
+      worktrees.map(async ({ entry, worktree }) => {
+        this.updateProgress(entry.provider.name, { status: 'running', startTime: Date.now() });
         
         try {
-          // Pass baseCommit to agent for accurate diff calculation
-          const result = await agent.execute(task, worktree.path, worktree.branch, worktree.baseCommit);
-          this.updateProgress(agent.name, {
+          const result = await entry.provider.runAsAgent(
+            task, 
+            worktree.path, 
+            worktree.branch
+          );
+          this.updateProgress(entry.provider.name, {
             status: result.success ? 'completed' : 'failed',
             endTime: Date.now(),
             error: result.error,
           });
           return result;
         } catch (err) {
-          this.updateProgress(agent.name, {
+          this.updateProgress(entry.provider.name, {
             status: 'failed',
             endTime: Date.now(),
             error: (err as Error).message,
@@ -182,21 +160,21 @@ export class Orchestrator {
   /**
    * Check if all agents are available, return only available ones
    */
-  private async checkAgentAvailability(): Promise<Agent[]> {
+  private async checkAgentAvailability(): Promise<AgentEntry[]> {
     const availability = await Promise.all(
-      this.agents.map(async (agent) => ({
-        agent,
-        available: await agent.isAvailable(),
+      this.agents.map(async (entry) => ({
+        entry,
+        available: await entry.provider.checkAvailable(),
       }))
     );
 
     const unavailable = availability.filter((a) => !a.available);
-    const available = availability.filter((a) => a.available).map((a) => a.agent);
+    const available = availability.filter((a) => a.available).map((a) => a.entry);
     
     // Mark unavailable agents
-    for (const { agent } of unavailable) {
-      this.updateProgress(agent.name, { status: 'unavailable' });
-      console.log(`⚠️  Agent '${agent.name}' is not installed, skipping...`);
+    for (const { entry } of unavailable) {
+      this.updateProgress(entry.provider.name, { status: 'unavailable' });
+      console.log(`⚠️  Agent '${entry.provider.name}' is not available, skipping...`);
     }
 
     return available;
@@ -307,7 +285,7 @@ export class Orchestrator {
           break;
         }
         case 'unavailable':
-          line = `  ⚫ ${name}: not installed`;
+          line = `  ⚫ ${name}: not available (CLI not installed or API key missing)`;
           break;
         default:
           line = `  ⏳ ${name}: ${prog.status}`;
@@ -346,10 +324,17 @@ export class Orchestrator {
   }
 
   /**
-   * Get list of available agents (registered)
+   * Get list of available providers (registered)
    */
-  static getAvailableAgents(): string[] {
-    return AgentRegistry.list();
+  static getAvailableProviders(): string[] {
+    return ProviderRegistry.list();
+  }
+
+  /**
+   * Get all available model specs
+   */
+  static getAllModelSpecs(): string[] {
+    return ProviderRegistry.listAllModels();
   }
 
   /**
