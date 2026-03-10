@@ -11,17 +11,32 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "start": "node dist/cli.js",
-    "test": "node --test"
+    "test": "npm run build:tests && node --test dist-tests/tests/*.test.js",
+    "test:unit": "npm run build:tests && node --test dist-tests/tests/config.test.js dist-tests/tests/logging.test.js",
+    "test:integration": "npm run build:tests && node --test dist-tests/tests/worktree.test.js",
+    "build:tests": "tsc -p tsconfig.test.json",
+    "lint": "tsc --noEmit"
   },
   "keywords": [
     "ai",
     "cli",
     "multi-agent",
     "claude",
-    "deliberation"
+    "gemini",
+    "codex",
+    "deliberation",
+    "code-review"
   ],
   "author": "",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourrepo/swarm-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yourrepo/swarm-cli/issues"
+  },
+  "homepage": "https://github.com/yourrepo/swarm-cli#readme",
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
     "@google/generative-ai": "^0.24.1",
@@ -38,5 +53,10 @@
   },
   "engines": {
     "node": ">=20.0.0"
-  }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ]
 }

@@ -124,13 +124,19 @@ export function mergeWithCliOptions(
 }
 
 /**
- * Initialize config with defaults if it doesn't exist
+ * Initialize config with defaults
+ * Creates if doesn't exist, or shows current config
  */
 export async function initConfig(): Promise<void> {
-  if (!existsSync(CONFIG_FILE)) {
-    await saveConfig(DEFAULT_CONFIG);
-    console.log(`Created default config at ${CONFIG_FILE}`);
+  if (existsSync(CONFIG_FILE)) {
+    console.log(`Config already exists at ${CONFIG_FILE}`);
+    console.log('\nCurrent configuration:');
+    const config = await loadConfig();
+    console.log(JSON.stringify(config, null, 2));
+    return;
   }
+  
+  await saveConfig(DEFAULT_CONFIG);
 }
 
 /**
@@ -175,4 +181,70 @@ export function validateModelSpec(spec: string): { valid: boolean; error?: strin
   }
   
   return { valid: true };
+}
+
+/**
+ * Validate entire config structure
+ */
+export function validateConfig(config: unknown): { valid: boolean; errors: string[] } {
+  const errors: string[] = [];
+  
+  if (!config || typeof config !== 'object') {
+    return { valid: false, errors: ['Config must be an object'] };
+  }
+  
+  const cfg = config as Record<string, unknown>;
+  
+  // Validate defaultAgents
+  if (cfg.defaultAgents !== undefined) {
+    if (!Array.isArray(cfg.defaultAgents)) {
+      errors.push('defaultAgents must be an array');
+    } else {
+      for (const agent of cfg.defaultAgents) {
+        if (typeof agent !== 'string') {
+          errors.push('Each agent in defaultAgents must be a string');
+        } else {
+          const validation = validateModelSpec(agent);
+          if (!validation.valid) {
+            errors.push(`Invalid agent "${agent}": ${validation.error}`);
+          }
+        }
+      }
+    }
+  }
+  
+  // Validate defaultSynthesizer
+  if (cfg.defaultSynthesizer !== undefined) {
+    if (typeof cfg.defaultSynthesizer !== 'string') {
+      errors.push('defaultSynthesizer must be a string');
+    } else {
+      const validation = validateModelSpec(cfg.defaultSynthesizer);
+      if (!validation.valid) {
+        errors.push(`Invalid synthesizer: ${validation.error}`);
+      }
+    }
+  }
+  
+  // Validate providers
+  if (cfg.providers !== undefined) {
+    if (typeof cfg.providers !== 'object' || cfg.providers === null) {
+      errors.push('providers must be an object');
+    } else {
+      const providers = cfg.providers as Record<string, unknown>;
+      for (const [name, providerCfg] of Object.entries(providers)) {
+        if (typeof providerCfg !== 'object' || providerCfg === null) {
+          errors.push(`Provider ${name} config must be an object`);
+          continue;
+        }
+        
+        const pc = providerCfg as Record<string, unknown>;
+        
+        if (pc.auth !== undefined && pc.auth !== 'api' && pc.auth !== 'cli') {
+          errors.push(`Provider ${name}: auth must be "api" or "cli"`);
+        }
+      }
+    }
+  }
+  
+  return { valid: errors.length === 0, errors };
 }

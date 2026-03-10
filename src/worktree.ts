@@ -191,6 +191,9 @@ export class WorktreeManager {
       }
     }
 
+    // Clear tracked list (in case paths didn't match exactly)
+    this.worktrees = [];
+
     // Prune worktree references
     await this.git.raw(['worktree', 'prune']);
   }

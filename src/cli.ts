@@ -17,9 +17,11 @@ import { render } from 'ink';
 import { Orchestrator } from './orchestrator.js';
 import { Synthesizer } from './synthesizer.js';
 import { SynthesisResult, AgentResult, FileConflict } from './types.js';
-import { loadConfig, getConfigPath, validateModelSpec } from './config.js';
+import { loadConfig, getConfigPath, validateModelSpec, initConfig, saveConfig } from './config.js';
 import { ProviderRegistry, listAllModels } from './models/index.js';
 import { App, Decision } from './ui/index.js';
+import { writeSwarmLog, SwarmLogEntry, DecisionEntry, createCommitMessage } from './logging.js';
+import { Applier } from './applier.js';
 import path from 'node:path';
 
 interface CliArgs {
@@ -32,14 +34,54 @@ interface CliArgs {
   cleanup: boolean;
   listModels: boolean;
   initConfig: boolean;
-  interactive: boolean;  // New: use Ink UI
+  interactive: boolean;
+  apply: boolean;       // Auto-apply chosen changes
+  logToFile: boolean;   // Write to SWARM_LOG.md
 }
+
+// Track orchestrator globally for cleanup on signals
+let globalOrchestrator: Orchestrator | null = null;
+let cleanupInProgress = false;
+
+/**
+ * Handle graceful shutdown
+ */
+async function handleShutdown(signal: string): Promise<void> {
+  if (cleanupInProgress) {
+    console.log('\nForced exit.');
+    process.exit(1);
+  }
+  
+  cleanupInProgress = true;
+  console.log(`\n\n⚠️  Received ${signal}, cleaning up...`);
+  
+  if (globalOrchestrator) {
+    try {
+      await globalOrchestrator.cleanup();
+      console.log('✅ Worktrees cleaned up.');
+    } catch (err) {
+      console.error('⚠️  Cleanup failed:', (err as Error).message);
+    }
+  }
+  
+  process.exit(0);
+}
+
+// Set up signal handlers
+process.on('SIGINT', () => handleShutdown('SIGINT'));
+process.on('SIGTERM', () => handleShutdown('SIGTERM'));
 
 async function parseArgs(): Promise<CliArgs> {
   const args = process.argv.slice(2);
   
   if (args.length === 0 || args.includes('--help') || args.includes('-h')) {
     printHelp();
+    process.exit(0);
+  }
+
+  if (args.includes('--version')) {
+    // Version is embedded at build time
+    console.log('swarm-cli v0.1.0');
     process.exit(0);
   }
 
@@ -55,6 +97,8 @@ async function parseArgs(): Promise<CliArgs> {
       listModels: true,
       initConfig: false,
       interactive: false,
+      apply: false,
+      logToFile: true,
     };
   }
 
@@ -70,6 +114,8 @@ async function parseArgs(): Promise<CliArgs> {
       listModels: false,
       initConfig: true,
       interactive: false,
+      apply: false,
+      logToFile: true,
     };
   }
 
@@ -86,7 +132,9 @@ async function parseArgs(): Promise<CliArgs> {
     cleanup: true,
     listModels: false,
     initConfig: false,
-    interactive: true,  // Default to interactive mode
+    interactive: true,
+    apply: false,
+    logToFile: true,
   };
 
   let i = 0;
@@ -106,22 +154,42 @@ async function parseArgs(): Promise<CliArgs> {
       result.verbose = true;
     } else if (arg === '--json') {
       result.outputFormat = 'json';
-      result.interactive = false;  // JSON output disables interactive mode
+      result.interactive = false;
     } else if (arg === '--no-cleanup') {
       result.cleanup = false;
     } else if (arg === '--no-ui' || arg === '--batch') {
       result.interactive = false;
     } else if (arg === '--ui' || arg === '-i') {
       result.interactive = true;
+    } else if (arg === '--apply') {
+      result.apply = true;
+    } else if (arg === '--no-log') {
+      result.logToFile = false;
     } else if (!arg.startsWith('-')) {
       result.task = arg;
     }
     i++;
   }
 
+  // Validate task is provided
   if (!result.task) {
-    console.error('Error: Task is required');
-    printHelp();
+    console.error('❌ Error: Task is required\n');
+    console.error('Usage: swarm "<task>" [options]');
+    console.error('Run "swarm --help" for more information.\n');
+    process.exit(1);
+  }
+
+  // Validate task is not empty
+  if (result.task.trim().length === 0) {
+    console.error('❌ Error: Task cannot be empty\n');
+    process.exit(1);
+  }
+
+  // Validate agents list
+  if (result.agents.length === 0) {
+    console.error('❌ Error: No agents specified\n');
+    console.error('Configure default agents in ~/.swarm/config.json or use --agents flag.');
+    console.error('Run "swarm --list-models" to see available agents.\n');
     process.exit(1);
   }
 
@@ -129,14 +197,14 @@ async function parseArgs(): Promise<CliArgs> {
   for (const agent of result.agents) {
     const validation = validateModelSpec(agent);
     if (!validation.valid) {
-      console.error(`Error: ${validation.error}`);
+      console.error(`❌ Error: ${validation.error}`);
       process.exit(1);
     }
   }
 
   const synthValidation = validateModelSpec(result.synthesizer);
   if (!synthValidation.valid) {
-    console.error(`Error: ${synthValidation.error}`);
+    console.error(`❌ Error: ${synthValidation.error}`);
     process.exit(1);
   }
 
@@ -150,10 +218,10 @@ function printHelp(): void {
   console.log(`
 swarm - Multi-Agent Deliberation CLI
 
-Usage: swarm <task> [options]
+Usage: swarm "<task>" [options]
 
 Arguments:
-  task                       The coding task to execute (required)
+  task                       The coding task to execute (required, in quotes)
 
 Options:
   -a, --agents <list>        Comma-separated list of agents/models
@@ -170,10 +238,13 @@ Options:
   -i, --ui                   Enable interactive UI (default)
   --no-ui, --batch           Disable interactive UI (batch mode)
   
+  --apply                    Auto-apply chosen agent's changes to main
+  --no-log                   Don't write to SWARM_LOG.md
   --json                     Output synthesis as JSON (implies --no-ui)
   --no-cleanup               Don't cleanup worktrees after execution
   --list-models              Show available models and their status
   --init                     Create default config file
+  --version                  Show version number
   -h, --help                 Show this help message
 
 Available Providers: ${providers}
@@ -184,7 +255,7 @@ Examples:
   swarm "refactor auth" --agents claude:opus,gemini:pro
   swarm "add tests" --agents claude:sonnet,codex --synthesizer claude:opus
   swarm "fix bug" --verbose --json
-  swarm "review code" --no-ui  # Batch mode without interactive UI
+  swarm "review code" --no-ui --apply
 
 Interactive UI:
   The interactive UI shows real-time agent progress and allows you to
@@ -193,7 +264,7 @@ Interactive UI:
 Configuration:
   Config file: ~/.swarm/config.json
   
-  The config file can set defaults for agents, synthesizer, and auth methods.
+  The config file sets defaults for agents, synthesizer, and auth methods.
   Run 'swarm --init' to create a default config file.
   
   Environment variables:
@@ -203,10 +274,13 @@ Configuration:
     SWARM_AGENTS         - Override default agents
     SWARM_SYNTHESIZER    - Override default synthesizer
 
-Auth Modes:
-  Each provider supports CLI auth (subscription-based, no API key needed)
-  or API auth (requires API key). The tool auto-detects based on available
-  API keys, or you can configure in ~/.swarm/config.json.
+Logging:
+  Session logs are written to SWARM_LOG.md in the repository.
+  This includes: task, agents used, conflicts found, decisions made.
+  Use --no-log to disable.
+
+Ctrl+C:
+  Press Ctrl+C to gracefully cancel and cleanup worktrees.
 `);
 }
 
@@ -243,10 +317,32 @@ async function listModels(): Promise<void> {
 }
 
 async function initConfigFile(): Promise<void> {
-  const { initConfig } = await import('./config.js');
   await initConfig();
-  console.log(`\nConfig initialized at ${getConfigPath()}`);
-  console.log('Edit this file to customize default agents, synthesizer, and auth methods.');
+  console.log(`
+✅ Config initialized at ${getConfigPath()}
+
+Default configuration created with:
+  • Default agents: claude
+  • Default synthesizer: claude:sonnet
+  • Auth mode: CLI (uses installed CLI tools)
+
+Edit ~/.swarm/config.json to customize:
+  • Add more default agents
+  • Switch to API auth mode
+  • Configure provider-specific settings
+
+Available options:
+{
+  "defaultAgents": ["claude:sonnet", "gemini:pro"],
+  "defaultSynthesizer": "claude:opus",
+  "providers": {
+    "claude": { "auth": "api" },    // Use API key
+    "gemini": { "auth": "cli" }     // Use CLI tool
+  }
+}
+
+Run 'swarm --list-models' to see available models and their status.
+`);
 }
 
 function formatTextOutput(synthesis: SynthesisResult): string {
@@ -364,16 +460,21 @@ function formatTextOutput(synthesis: SynthesisResult): string {
  * Run in interactive mode with Ink UI
  */
 async function runInteractive(args: CliArgs): Promise<void> {
+  const startTime = Date.now();
+  
   const orchestrator = new Orchestrator({
     repoPath: args.repoPath,
     verbose: args.verbose,
   });
+  
+  // Store globally for signal handling
+  globalOrchestrator = orchestrator;
 
   // Add agents
   try {
     await orchestrator.addAgents(args.agents);
   } catch (err) {
-    console.error(`Error: ${(err as Error).message}`);
+    console.error(`❌ Error: ${(err as Error).message}`);
     process.exit(1);
   }
 
@@ -382,8 +483,17 @@ async function runInteractive(args: CliArgs): Promise<void> {
     verbose: args.verbose,
   });
 
-  // Track decisions for later
-  let finalDecisions: Map<string, Decision> = new Map();
+  // Track decisions and results for logging
+  // Using 'any' wrapper to avoid TypeScript closure narrowing issues
+  const state: {
+    decisions: Map<string, Decision>;
+    synthesis: SynthesisResult | null;
+    results: AgentResult[];
+  } = {
+    decisions: new Map(),
+    synthesis: null,
+    results: [],
+  };
 
   // Render the Ink app
   const { waitUntilExit } = render(
@@ -391,19 +501,22 @@ async function runInteractive(args: CliArgs): Promise<void> {
       task: args.task,
       agents: args.agents,
       onExecute: async () => {
-        return orchestrator.execute(args.task);
+        const results = await orchestrator.execute(args.task);
+        state.results = results;
+        return results;
       },
       onSynthesize: async (results: AgentResult[]) => {
-        return synthesizer.synthesize(args.task, results);
+        const synthesis = await synthesizer.synthesize(args.task, results);
+        state.synthesis = synthesis;
+        return synthesis;
       },
       onDecision: async (conflict: FileConflict, decision: Decision) => {
-        // Log decision for verbose mode
         if (args.verbose) {
           console.log(`Decision for ${conflict.filePath}: ${decision.choice}`);
         }
       },
       onComplete: (decisions: Map<string, Decision>) => {
-        finalDecisions = decisions;
+        state.decisions = decisions;
       },
       verbose: args.verbose,
     })
@@ -411,6 +524,80 @@ async function runInteractive(args: CliArgs): Promise<void> {
 
   // Wait for UI to finish
   await waitUntilExit();
+
+  const duration = Date.now() - startTime;
+
+  // Apply changes if requested
+  if (args.apply && state.decisions.size > 0 && state.synthesis) {
+    console.log('\n📦 Applying chosen changes...');
+    
+    const applier = new Applier(args.repoPath, orchestrator.getWorktreeManager());
+    const worktrees = orchestrator.getWorktreeManager().getTrackedWorktrees();
+    
+    // Map decisions to worktrees
+    const fileDecisions = new Map<string, { agentName: string; worktreePath: string }>();
+    
+    for (const [filePath, decision] of state.decisions) {
+      if (decision.agentName) {
+        const worktree = worktrees.find(w => w.branch.includes(decision.agentName!));
+        if (worktree) {
+          fileDecisions.set(filePath, {
+            agentName: decision.agentName,
+            worktreePath: worktree.path,
+          });
+        }
+      }
+    }
+
+    if (fileDecisions.size > 0) {
+      const results = await applier.createApplySession(fileDecisions);
+      for (const result of results) {
+        if (result.success) {
+          console.log(`  ✅ Applied: ${result.files.join(', ')}`);
+        } else {
+          console.log(`  ❌ Failed: ${result.error}`);
+        }
+      }
+    }
+  }
+
+  // Write log if enabled
+  if (args.logToFile && state.synthesis) {
+    const logEntry: SwarmLogEntry = {
+      timestamp: new Date().toISOString(),
+      task: args.task,
+      repoPath: args.repoPath,
+      agents: args.agents,
+      synthesizer: args.synthesizer,
+      duration,
+      agentResults: state.results.map(r => ({
+        name: r.agentName,
+        success: r.success,
+        filesChanged: r.filesChanged.length,
+      })),
+      conflicts: state.synthesis.conflicts.map(c => ({
+        filePath: c.filePath,
+        severity: c.severity,
+        type: c.conflictType,
+      })),
+      decisions: Array.from(state.decisions.entries()).map(([filePath, d]) => ({
+        filePath,
+        choice: d.choice,
+        agentName: d.agentName,
+        customInput: d.customInput,
+        timestamp: new Date().toISOString(),
+      })),
+    };
+
+    try {
+      await writeSwarmLog(args.repoPath, logEntry);
+      console.log('📝 Session logged to SWARM_LOG.md');
+    } catch (err) {
+      if (args.verbose) {
+        console.log(`⚠️  Could not write log: ${(err as Error).message}`);
+      }
+    }
+  }
 
   // Cleanup
   if (args.cleanup) {
@@ -424,26 +611,29 @@ async function runInteractive(args: CliArgs): Promise<void> {
     }
   }
 
-  // Output decision summary if any were made
-  if (finalDecisions.size > 0) {
+  // Output decision summary
+  if (state.decisions.size > 0) {
     console.log('\n📝 Decisions made:');
-    for (const [file, decision] of finalDecisions) {
+    for (const [file, decision] of state.decisions) {
       console.log(`   ${file}: ${decision.choice}${decision.agentName ? ` (${decision.agentName})` : ''}`);
     }
   }
 
   console.log('\n✨ Done!');
+  globalOrchestrator = null;
 }
 
 /**
  * Run in batch mode (original behavior, no interactive UI)
  */
 async function runBatch(args: CliArgs): Promise<void> {
+  const startTime = Date.now();
+
   // Check synthesis availability
   const synthAvailable = await Synthesizer.isAvailable(args.synthesizer);
   
   if (!synthAvailable) {
-    console.error(`Error: Synthesizer model '${args.synthesizer}' is not available.`);
+    console.error(`❌ Error: Synthesizer model '${args.synthesizer}' is not available.`);
     console.error('Check that the required CLI is installed or API key is set.');
     console.error('Run "swarm --list-models" to see available models.');
     process.exit(1);
@@ -461,43 +651,105 @@ async function runBatch(args: CliArgs): Promise<void> {
     repoPath: args.repoPath,
     verbose: args.verbose,
   });
+  
+  // Store globally for signal handling
+  globalOrchestrator = orchestrator;
 
   // Add agents
   try {
     await orchestrator.addAgents(args.agents);
   } catch (err) {
-    console.error(`Error: ${(err as Error).message}`);
+    console.error(`❌ Error: ${(err as Error).message}`);
     process.exit(1);
   }
+
+  let results: AgentResult[] = [];
+  let synthesis: SynthesisResult | null = null;
 
   try {
     // Execute agents in parallel
     console.log('🚀 Running agents in parallel...\n');
-    const results = await orchestrator.execute(args.task);
+    results = await orchestrator.execute(args.task);
 
     // Check if any agent succeeded
     const successCount = results.filter(r => r.success).length;
     console.log(`\n✓ Execution complete: ${successCount}/${results.length} agents succeeded`);
 
     // Only synthesize if we have results
-    if (results.length > 0) {
+    if (results.length > 0 && results.some(r => r.success)) {
       // Synthesize results
       console.log('🔬 Synthesizing results...');
       const synthesizer = new Synthesizer({ 
         model: args.synthesizer,
         verbose: args.verbose 
       });
-      const synthesis = await synthesizer.synthesize(args.task, results);
+      
+      try {
+        synthesis = await synthesizer.synthesize(args.task, results);
+      } catch (synthError) {
+        console.error(`\n⚠️  Synthesis failed: ${(synthError as Error).message}`);
+        console.log('\n📊 Falling back to raw diff summary:\n');
+        
+        // Show raw diffs as fallback
+        for (const result of results) {
+          console.log(`\n─── ${result.agentName} ───`);
+          console.log(`Status: ${result.success ? '✅ Success' : '❌ Failed'}`);
+          console.log(`Files: ${result.filesChanged.join(', ') || 'None'}`);
+          if (result.diff) {
+            console.log('Diff (truncated):');
+            console.log(result.diff.slice(0, 1000) + (result.diff.length > 1000 ? '\n...' : ''));
+          }
+        }
+        synthesis = null;
+      }
 
       // Output results
-      console.log('');
-      if (args.outputFormat === 'json') {
-        console.log(JSON.stringify(synthesis, null, 2));
-      } else {
-        console.log(formatTextOutput(synthesis));
+      if (synthesis) {
+        console.log('');
+        if (args.outputFormat === 'json') {
+          console.log(JSON.stringify(synthesis, null, 2));
+        } else {
+          console.log(formatTextOutput(synthesis));
+        }
       }
-    } else {
+    } else if (results.length === 0) {
       console.log('\n⚠️  No agent results to synthesize.');
+    } else {
+      console.log('\n⚠️  All agents failed. Check agent availability with --list-models.');
+    }
+
+    // Write log if enabled
+    const duration = Date.now() - startTime;
+    
+    if (args.logToFile) {
+      const logEntry: SwarmLogEntry = {
+        timestamp: new Date().toISOString(),
+        task: args.task,
+        repoPath: args.repoPath,
+        agents: args.agents,
+        synthesizer: args.synthesizer,
+        duration,
+        agentResults: results.map(r => ({
+          name: r.agentName,
+          success: r.success,
+          filesChanged: r.filesChanged.length,
+        })),
+        conflicts: synthesis?.conflicts.map(c => ({
+          filePath: c.filePath,
+          severity: c.severity,
+          type: c.conflictType,
+        })) || [],
+        decisions: [],
+      };
+
+      try {
+        await writeSwarmLog(args.repoPath, logEntry);
+        console.log('\n📝 Session logged to SWARM_LOG.md');
+      } catch (err) {
+        if (args.verbose) {
+          console.log(`⚠️  Could not write log: ${(err as Error).message}`);
+        }
+      }
     }
 
     // Cleanup
@@ -528,37 +780,51 @@ async function runBatch(args: CliArgs): Promise<void> {
     
     process.exit(1);
   }
+  
+  globalOrchestrator = null;
 }
 
 async function main(): Promise<void> {
-  const args = await parseArgs();
+  try {
+    const args = await parseArgs();
 
-  // Handle --list-models
-  if (args.listModels) {
-    await listModels();
-    return;
-  }
-
-  // Handle --init
-  if (args.initConfig) {
-    await initConfigFile();
-    return;
-  }
-
-  // Check if TTY is available for interactive mode
-  const isTTY = process.stdin.isTTY && process.stdout.isTTY;
-  
-  if (args.interactive && isTTY) {
-    await runInteractive(args);
-  } else {
-    if (args.interactive && !isTTY) {
-      console.log('Note: Interactive mode not available (not a TTY). Running in batch mode.');
+    // Handle --list-models
+    if (args.listModels) {
+      await listModels();
+      return;
     }
-    await runBatch(args);
+
+    // Handle --init
+    if (args.initConfig) {
+      await initConfigFile();
+      return;
+    }
+
+    // Check if TTY is available for interactive mode
+    const isTTY = process.stdin.isTTY && process.stdout.isTTY;
+    
+    if (args.interactive && isTTY) {
+      await runInteractive(args);
+    } else {
+      if (args.interactive && !isTTY) {
+        console.log('ℹ️  Interactive mode not available (not a TTY). Running in batch mode.\n');
+      }
+      await runBatch(args);
+    }
+  } catch (err) {
+    console.error('❌ Fatal error:', (err as Error).message);
+    
+    // Cleanup on fatal error
+    if (globalOrchestrator) {
+      try {
+        await globalOrchestrator.cleanup();
+      } catch {
+        // Ignore
+      }
+    }
+    
+    process.exit(1);
   }
 }
 
-main().catch((err) => {
-  console.error('Fatal error:', err);
-  process.exit(1);
-});
+main();
