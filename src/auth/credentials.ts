@@ -43,6 +43,7 @@ export type Credentials = OAuthCredentials | TokenCredentials;
 
 const CLAUDE_CLI_CREDENTIALS_PATH = '.claude/.credentials.json';
 const CLAUDE_CLI_KEYCHAIN_SERVICE = 'Claude Code-credentials';
+const OPENCLAW_AUTH_PROFILES_PATH = '.openclaw/agents/main/agent/auth-profiles.json';
 
 /**
  * Read Claude CLI credentials from macOS Keychain
@@ -152,8 +153,47 @@ function readClaudeFileCredentials(): Credentials | null {
 /**
  * Read Claude CLI credentials (keychain first, then file)
  */
+/**
+ * Read Claude credentials from OpenClaw auth profiles
+ */
+function readOpenClawAuthProfiles(): Credentials | null {
+  try {
+    const authPath = path.join(os.homedir(), OPENCLAW_AUTH_PROFILES_PATH);
+    
+    if (!fs.existsSync(authPath)) {
+      return null;
+    }
+
+    const content = fs.readFileSync(authPath, 'utf-8');
+    const data = JSON.parse(content);
+    
+    // Find an anthropic profile
+    const profiles = data.profiles || {};
+    for (const [profileId, profile] of Object.entries(profiles)) {
+      const p = profile as any;
+      if (p.provider === 'anthropic' && p.token) {
+        return {
+          type: 'token',
+          provider: 'anthropic',
+          token: p.token,
+        };
+      }
+    }
+    
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export function readClaudeCredentials(): Credentials | null {
-  // Try keychain first (macOS)
+  // Try OpenClaw auth profiles first (most reliable)
+  const openclawCreds = readOpenClawAuthProfiles();
+  if (openclawCreds) {
+    return openclawCreds;
+  }
+
+  // Try keychain (macOS)
   const keychainCreds = readClaudeKeychainCredentials();
   if (keychainCreds) {
     return keychainCreds;
