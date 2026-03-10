@@ -4,13 +4,9 @@
  * THIS IS THE MOST CRITICAL PART OF SWARM-CLI
  * The quality of conflict analysis determines the product's value
  * 
- * Supports two modes:
- * 1. Direct API (requires ANTHROPIC_API_KEY)
- * 2. Claude CLI fallback (uses `claude` command)
+ * Now uses the flexible model system - can use any provider for synthesis
  */
 
-import Anthropic from '@anthropic-ai/sdk';
-import { spawn } from 'node:child_process';
 import {
   AgentResult,
   SynthesisResult,
@@ -18,46 +14,62 @@ import {
   FileConflict,
   Recommendation,
 } from './types.js';
+import { getProvider, ModelProvider, AuthType } from './models/index.js';
+import { loadConfig, getEffectiveAuth } from './config.js';
 
 export interface SynthesizerOptions {
-  model?: string;
-  maxTokens?: number;
+  model?: string;       // e.g., 'claude:sonnet', 'openai:gpt-4.1', 'gemini:pro'
+  authType?: AuthType;  // 'api' or 'cli'
   verbose?: boolean;
-  useClaudeCli?: boolean; // Force Claude CLI mode
 }
 
 export class Synthesizer {
-  private client: Anthropic | null = null;
+  private provider: ModelProvider | null = null;
   private options: SynthesizerOptions;
-  private useClaudeCli: boolean;
+  private verbose: boolean;
 
   constructor(options: SynthesizerOptions = {}) {
     this.options = {
-      model: 'claude-sonnet-4-20250514',
-      maxTokens: 8192,
+      model: 'claude:sonnet',
       verbose: false,
-      useClaudeCli: false,
       ...options,
     };
+    this.verbose = options.verbose ?? false;
+  }
 
-    // Determine if we should use Claude CLI or API
-    this.useClaudeCli = options.useClaudeCli || !process.env.ANTHROPIC_API_KEY;
+  /**
+   * Initialize the synthesizer with the configured model
+   */
+  private async initProvider(): Promise<ModelProvider> {
+    if (this.provider) return this.provider;
 
-    if (!this.useClaudeCli) {
-      // Initialize Anthropic client (uses ANTHROPIC_API_KEY env var)
-      try {
-        this.client = new Anthropic();
-      } catch (err) {
-        this.log('Failed to initialize Anthropic client, falling back to Claude CLI');
-        this.useClaudeCli = true;
-      }
+    const modelSpec = this.options.model || 'claude:sonnet';
+    const config = await loadConfig();
+    
+    // Determine auth type
+    const providerName = modelSpec.split(':')[0];
+    const authType = this.options.authType || getEffectiveAuth(config, providerName);
+    
+    this.log(`Using ${modelSpec} with ${authType} auth for synthesis`);
+    
+    const provider = getProvider(modelSpec, authType);
+    if (!provider) {
+      throw new Error(`Unknown model: ${modelSpec}`);
     }
-
-    if (this.useClaudeCli) {
-      this.log('Using Claude CLI for synthesis (no API key required)');
-    } else {
-      this.log('Using Anthropic API for synthesis');
+    
+    // Check availability
+    const available = await provider.checkAvailable();
+    if (!available) {
+      throw new Error(
+        `Model ${modelSpec} is not available. ` +
+        (authType === 'api' 
+          ? `Check that the required API key is set.`
+          : `Check that the CLI is installed.`)
+      );
     }
+    
+    this.provider = provider;
+    return provider;
   }
 
   /**
@@ -66,16 +78,14 @@ export class Synthesizer {
   async synthesize(task: string, results: AgentResult[]): Promise<SynthesisResult> {
     this.log(`Synthesizing results from ${results.length} agent(s)...`);
 
+    const provider = await this.initProvider();
+
     // Build the analysis prompt
     const prompt = this.buildAnalysisPrompt(task, results);
 
-    let analysisText: string;
-
-    if (this.useClaudeCli) {
-      analysisText = await this.callClaudeCli(prompt);
-    } else {
-      analysisText = await this.callAnthropicApi(prompt);
-    }
+    // Call the model
+    const response = await provider.runAsSynthesizer(prompt);
+    const analysisText = response.content;
 
     // Parse the structured response
     const synthesis = this.parseAnalysis(task, results, analysisText);
@@ -85,94 +95,13 @@ export class Synthesizer {
   }
 
   /**
-   * Call Claude via direct API
+   * Get info about which model is being used
    */
-  private async callAnthropicApi(prompt: string): Promise<string> {
-    if (!this.client) {
-      throw new Error('Anthropic client not initialized');
-    }
-
-    const response = await this.client.messages.create({
-      model: this.options.model!,
-      max_tokens: this.options.maxTokens!,
-      messages: [
-        {
-          role: 'user',
-          content: prompt,
-        },
-      ],
-    });
-
-    // Extract text from response
-    return response.content
-      .filter((block): block is Anthropic.TextBlock => block.type === 'text')
-      .map((block) => block.text)
-      .join('\n');
-  }
-
-  /**
-   * Call Claude via CLI as fallback
-   */
-  private async callClaudeCli(prompt: string): Promise<string> {
-    return new Promise((resolve, reject) => {
-      let output = '';
-      let errorOutput = '';
-
-      // Use claude CLI in print mode
-      const proc = spawn('claude', ['-p', prompt], {
-        shell: true,
-        stdio: 'pipe',
-        env: process.env,
-      });
-
-      proc.stdout?.on('data', (data) => {
-        output += data.toString();
-      });
-
-      proc.stderr?.on('data', (data) => {
-        errorOutput += data.toString();
-      });
-
-      // 5 minute timeout for synthesis
-      const timeout = setTimeout(() => {
-        proc.kill('SIGTERM');
-        reject(new Error('Claude CLI synthesis timed out'));
-      }, 300000);
-
-      proc.on('close', (code) => {
-        clearTimeout(timeout);
-        if (code === 0) {
-          resolve(output.trim());
-        } else {
-          reject(new Error(`Claude CLI exited with code ${code}: ${errorOutput}`));
-        }
-      });
-
-      proc.on('error', (err) => {
-        clearTimeout(timeout);
-        reject(new Error(`Failed to spawn Claude CLI: ${err.message}`));
-      });
-    });
-  }
-
-  /**
-   * Check if Claude CLI is available
-   */
-  static async isClaudeCliAvailable(): Promise<boolean> {
-    return new Promise((resolve) => {
-      const proc = spawn('which', ['claude'], {
-        shell: true,
-        stdio: 'pipe',
-      });
-
-      proc.on('close', (code) => {
-        resolve(code === 0);
-      });
-
-      proc.on('error', () => {
-        resolve(false);
-      });
-    });
+  getModelInfo(): { model: string; authType?: AuthType } {
+    return {
+      model: this.options.model || 'claude:sonnet',
+      authType: this.options.authType,
+    };
   }
 
   /**
@@ -298,7 +227,7 @@ ${result.diff.slice(0, 5000)}${result.diff.length > 5000 ? '\n... (truncated)' :
   }
 
   /**
-   * Parse the Claude API response into structured data
+   * Parse the model response into structured data
    */
   private parseAnalysis(
     task: string,
@@ -399,9 +328,23 @@ ${result.diff.slice(0, 5000)}${result.diff.length > 5000 ? '\n... (truncated)' :
    * Log if verbose mode is enabled
    */
   private log(message: string): void {
-    if (this.options.verbose) {
+    if (this.verbose) {
       console.log(`[synthesizer] ${message}`);
     }
+  }
+
+  /**
+   * Static helper to check if any synthesis method is available
+   */
+  static async isAvailable(model: string = 'claude:sonnet'): Promise<boolean> {
+    const config = await loadConfig();
+    const providerName = model.split(':')[0];
+    const authType = getEffectiveAuth(config, providerName);
+    
+    const provider = getProvider(model, authType);
+    if (!provider) return false;
+    
+    return provider.checkAvailable();
   }
 }
 

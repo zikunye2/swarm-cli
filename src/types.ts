@@ -81,6 +81,8 @@ export interface WorktreeInfo {
   path: string;
   branch: string;
   commit: string;
+  /** The base commit SHA this worktree was branched from - used for accurate diffs */
+  baseCommit: string;
 }
 
 // CLI options

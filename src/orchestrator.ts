@@ -5,14 +5,13 @@
 import { WorktreeManager } from './worktree.js';
 import { Agent, AgentRegistry } from './agents/base.js';
 import { AgentResult, TaskConfig } from './types.js';
-import { ClaudeAgent } from './agents/claude.js';
-import { CodexAgent } from './agents/codex.js';
-import { GeminiAgent } from './agents/gemini.js';
+import { simpleGit } from 'simple-git';
 
-// Ensure agents are registered
-new ClaudeAgent();
-new CodexAgent();
-new GeminiAgent();
+// Import agents to trigger their registration via module side effects
+// The import itself executes the registration code at module load time
+import './agents/claude.js';
+import './agents/codex.js';
+import './agents/gemini.js';
 
 export interface OrchestratorOptions {
   repoPath: string;
@@ -47,6 +46,42 @@ export class Orchestrator {
   }
 
   /**
+   * Validate that the current directory is a git repository and is clean
+   */
+  async validateRepository(): Promise<void> {
+    const git = simpleGit(this.options.repoPath);
+
+    // Check if this is a git repository
+    const isRepo = await git.checkIsRepo();
+    if (!isRepo) {
+      throw new Error(`Not a git repository: ${this.options.repoPath}`);
+    }
+
+    // Check for uncommitted changes
+    const status = await git.status();
+    const hasUncommittedChanges = 
+      status.modified.length > 0 ||
+      status.staged.length > 0 ||
+      status.created.length > 0 ||
+      status.deleted.length > 0 ||
+      status.renamed.length > 0;
+
+    if (hasUncommittedChanges) {
+      const changedFiles = [
+        ...status.modified,
+        ...status.staged,
+        ...status.created,
+        ...status.deleted,
+        ...status.renamed.map((r: { to: string }) => r.to),
+      ];
+      throw new Error(
+        `Repository has uncommitted changes. Please commit or stash them first.\n` +
+        `Changed files: ${changedFiles.slice(0, 5).join(', ')}${changedFiles.length > 5 ? ` (+${changedFiles.length - 5} more)` : ''}`
+      );
+    }
+  }
+
+  /**
    * Add an agent to the orchestration
    */
   addAgent(agentName: string): void {
@@ -74,6 +109,9 @@ export class Orchestrator {
     if (this.agents.length === 0) {
       throw new Error('No agents configured. Add at least one agent before executing.');
     }
+
+    // Validate git repository before starting
+    await this.validateRepository();
 
     this.log(`Starting parallel execution with ${this.agents.length} agent(s)...`);
     this.log(`Task: "${task}"`);
@@ -110,7 +148,8 @@ export class Orchestrator {
         this.updateProgress(agent.name, { status: 'running', startTime: Date.now() });
         
         try {
-          const result = await agent.execute(task, worktree.path, worktree.branch);
+          // Pass baseCommit to agent for accurate diff calculation
+          const result = await agent.execute(task, worktree.path, worktree.branch, worktree.baseCommit);
           this.updateProgress(agent.name, {
             status: result.success ? 'completed' : 'failed',
             endTime: Date.now(),

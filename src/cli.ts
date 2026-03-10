@@ -56,7 +56,10 @@ function parseArgs(): CliArgs {
     const arg = args[i];
     
     if (arg === '--agents' || arg === '-a') {
-      result.agents = args[++i]?.split(',') || ['claude'];
+      const agentArg = args[++i];
+      // Handle empty string or missing value - fallback to default
+      const parsedAgents = agentArg?.split(',').filter(a => a.trim() !== '');
+      result.agents = parsedAgents && parsedAgents.length > 0 ? parsedAgents : ['claude'];
     } else if (arg === '--repo' || arg === '-r') {
       result.repoPath = args[++i] || process.cwd();
     } else if (arg === '--verbose' || arg === '-v') {

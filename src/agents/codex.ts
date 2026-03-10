@@ -26,8 +26,8 @@ export class CodexAgent extends BaseAgent implements Agent {
    */
   async isAvailable(): Promise<boolean> {
     return new Promise((resolve) => {
-      const proc = spawn('which', ['codex'], {
-        shell: true,
+      // No shell: true - prevent injection
+      const proc = spawn('codex', ['--version'], {
         stdio: 'pipe',
       });
       
@@ -43,8 +43,9 @@ export class CodexAgent extends BaseAgent implements Agent {
 
   /**
    * Execute Codex CLI with the given task
+   * @param baseCommit - The commit SHA to diff against (before agent changes)
    */
-  async execute(task: string, worktreePath: string, branchName: string): Promise<AgentResult> {
+  async execute(task: string, worktreePath: string, branchName: string, baseCommit?: string): Promise<AgentResult> {
     const startTime = Date.now();
     
     return new Promise((resolve) => {
@@ -54,7 +55,7 @@ export class CodexAgent extends BaseAgent implements Agent {
       // Build the prompt with context
       const fullPrompt = this.buildPrompt(task);
 
-      // Spawn Codex CLI with full-auto approval mode
+      // Spawn Codex CLI with full-auto approval mode - NO shell: true
       // Codex uses: codex --approval-mode full-auto "prompt"
       const proc = spawn('codex', [
         '--approval-mode', 'full-auto',
@@ -62,7 +63,6 @@ export class CodexAgent extends BaseAgent implements Agent {
         fullPrompt
       ], {
         cwd: worktreePath,
-        shell: true,
         stdio: 'pipe',
         env: {
           ...process.env,
@@ -108,11 +108,19 @@ export class CodexAgent extends BaseAgent implements Agent {
             await git.commit(`Swarm (Codex): ${task.slice(0, 50)}...`, { '--allow-empty': null });
           }
 
-          // Get the diff
-          try {
-            diff = await git.diff(['HEAD~1', 'HEAD']);
-          } catch {
-            diff = await git.diff(['HEAD']);
+          // Get the diff against the base commit (stored when worktree was created)
+          if (baseCommit) {
+            diff = await git.diff([baseCommit, 'HEAD']);
+          } else {
+            try {
+              diff = await git.diff(['main', 'HEAD']);
+            } catch {
+              try {
+                diff = await git.diff(['master', 'HEAD']);
+              } catch {
+                diff = await git.diff(['HEAD']);
+              }
+            }
           }
         } catch (err) {
           // Git operations failed, continue with what we have

@@ -5,6 +5,7 @@
 import { simpleGit, SimpleGit } from 'simple-git';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { WorktreeInfo } from './types.js';
 
 export class WorktreeManager {
@@ -18,12 +19,21 @@ export class WorktreeManager {
   }
 
   /**
+   * Generate a random suffix for branch names to prevent collisions
+   */
+  private generateRandomSuffix(length: number = 6): string {
+    return crypto.randomBytes(length).toString('hex').slice(0, length);
+  }
+
+  /**
    * Create a worktree for an agent
    */
   async createWorktree(agentName: string, baseBranch: string = 'main'): Promise<WorktreeInfo> {
     const timestamp = Date.now();
-    const branchName = `swarm/${agentName}-${timestamp}`;
-    const worktreePath = path.join(this.repoPath, '..', `.swarm-worktrees`, `${agentName}-${timestamp}`);
+    const randomSuffix = this.generateRandomSuffix();
+    // Add random suffix to prevent branch name collisions
+    const branchName = `swarm/${agentName}-${timestamp}-${randomSuffix}`;
+    const worktreePath = path.join(this.repoPath, '..', `.swarm-worktrees`, `${agentName}-${timestamp}-${randomSuffix}`);
 
     // Ensure worktrees directory exists
     await fs.mkdir(path.dirname(worktreePath), { recursive: true });
@@ -37,6 +47,10 @@ export class WorktreeManager {
       base = 'HEAD';
     }
 
+    // Store the base commit SHA BEFORE creating worktree
+    // This is the commit we'll diff against to see all agent changes
+    const baseCommit = (await this.git.revparse([base])).trim();
+
     // Create the worktree with a new branch
     await this.git.raw(['worktree', 'add', '-b', branchName, worktreePath, base]);
 
@@ -46,6 +60,7 @@ export class WorktreeManager {
       path: worktreePath,
       branch: branchName,
       commit: commit.trim(),
+      baseCommit, // Store the base commit for accurate diffs
     };
 
     this.worktrees.push(info);
@@ -54,6 +69,8 @@ export class WorktreeManager {
 
   /**
    * List all active worktrees
+   * Note: baseCommit is not available from git worktree list, 
+   * so we default to empty string for worktrees not tracked by this session
    */
   async listWorktrees(): Promise<WorktreeInfo[]> {
     const result = await this.git.raw(['worktree', 'list', '--porcelain']);
@@ -77,7 +94,14 @@ export class WorktreeManager {
       }
 
       if (worktreePath && branch) {
-        worktrees.push({ path: worktreePath, branch, commit });
+        // Try to find baseCommit from tracked worktrees
+        const tracked = this.worktrees.find(w => w.path === worktreePath);
+        worktrees.push({ 
+          path: worktreePath, 
+          branch, 
+          commit,
+          baseCommit: tracked?.baseCommit || '',
+        });
       }
     }
 
