@@ -6,15 +6,20 @@
  * Runs coding tasks across multiple AI CLI agents in parallel,
  * then synthesizes conflicts for human decision.
  * 
+ * Now with interactive Ink UI for real-time progress and decision making!
+ * 
  * Supports flexible model selection with provider:variant syntax
  * and multiple auth strategies (CLI or API).
  */
 
+import React from 'react';
+import { render } from 'ink';
 import { Orchestrator } from './orchestrator.js';
 import { Synthesizer } from './synthesizer.js';
-import { SynthesisResult } from './types.js';
-import { loadConfig, mergeWithCliOptions, getConfigPath, validateModelSpec } from './config.js';
-import { ProviderRegistry, listAllModels, isValidModelSpec } from './models/index.js';
+import { SynthesisResult, AgentResult, FileConflict } from './types.js';
+import { loadConfig, getConfigPath, validateModelSpec } from './config.js';
+import { ProviderRegistry, listAllModels } from './models/index.js';
+import { App, Decision } from './ui/index.js';
 import path from 'node:path';
 
 interface CliArgs {
@@ -27,6 +32,7 @@ interface CliArgs {
   cleanup: boolean;
   listModels: boolean;
   initConfig: boolean;
+  interactive: boolean;  // New: use Ink UI
 }
 
 async function parseArgs(): Promise<CliArgs> {
@@ -48,6 +54,7 @@ async function parseArgs(): Promise<CliArgs> {
       cleanup: true,
       listModels: true,
       initConfig: false,
+      interactive: false,
     };
   }
 
@@ -62,6 +69,7 @@ async function parseArgs(): Promise<CliArgs> {
       cleanup: true,
       listModels: false,
       initConfig: true,
+      interactive: false,
     };
   }
 
@@ -78,6 +86,7 @@ async function parseArgs(): Promise<CliArgs> {
     cleanup: true,
     listModels: false,
     initConfig: false,
+    interactive: true,  // Default to interactive mode
   };
 
   let i = 0;
@@ -97,8 +106,13 @@ async function parseArgs(): Promise<CliArgs> {
       result.verbose = true;
     } else if (arg === '--json') {
       result.outputFormat = 'json';
+      result.interactive = false;  // JSON output disables interactive mode
     } else if (arg === '--no-cleanup') {
       result.cleanup = false;
+    } else if (arg === '--no-ui' || arg === '--batch') {
+      result.interactive = false;
+    } else if (arg === '--ui' || arg === '-i') {
+      result.interactive = true;
     } else if (!arg.startsWith('-')) {
       result.task = arg;
     }
@@ -152,7 +166,11 @@ Options:
                              
   -r, --repo <path>          Repository path (default: current directory)
   -v, --verbose              Enable verbose output
-  --json                     Output synthesis as JSON
+  
+  -i, --ui                   Enable interactive UI (default)
+  --no-ui, --batch           Disable interactive UI (batch mode)
+  
+  --json                     Output synthesis as JSON (implies --no-ui)
   --no-cleanup               Don't cleanup worktrees after execution
   --list-models              Show available models and their status
   --init                     Create default config file
@@ -166,6 +184,11 @@ Examples:
   swarm "refactor auth" --agents claude:opus,gemini:pro
   swarm "add tests" --agents claude:sonnet,codex --synthesizer claude:opus
   swarm "fix bug" --verbose --json
+  swarm "review code" --no-ui  # Batch mode without interactive UI
+
+Interactive UI:
+  The interactive UI shows real-time agent progress and allows you to
+  resolve conflicts interactively. Use --no-ui for batch/CI environments.
 
 Configuration:
   Config file: ~/.swarm/config.json
@@ -337,21 +360,85 @@ function formatTextOutput(synthesis: SynthesisResult): string {
   return lines.join('\n');
 }
 
-async function main(): Promise<void> {
-  const args = await parseArgs();
+/**
+ * Run in interactive mode with Ink UI
+ */
+async function runInteractive(args: CliArgs): Promise<void> {
+  const orchestrator = new Orchestrator({
+    repoPath: args.repoPath,
+    verbose: args.verbose,
+  });
 
-  // Handle --list-models
-  if (args.listModels) {
-    await listModels();
-    return;
+  // Add agents
+  try {
+    await orchestrator.addAgents(args.agents);
+  } catch (err) {
+    console.error(`Error: ${(err as Error).message}`);
+    process.exit(1);
   }
 
-  // Handle --init
-  if (args.initConfig) {
-    await initConfigFile();
-    return;
+  const synthesizer = new Synthesizer({
+    model: args.synthesizer,
+    verbose: args.verbose,
+  });
+
+  // Track decisions for later
+  let finalDecisions: Map<string, Decision> = new Map();
+
+  // Render the Ink app
+  const { waitUntilExit } = render(
+    React.createElement(App, {
+      task: args.task,
+      agents: args.agents,
+      onExecute: async () => {
+        return orchestrator.execute(args.task);
+      },
+      onSynthesize: async (results: AgentResult[]) => {
+        return synthesizer.synthesize(args.task, results);
+      },
+      onDecision: async (conflict: FileConflict, decision: Decision) => {
+        // Log decision for verbose mode
+        if (args.verbose) {
+          console.log(`Decision for ${conflict.filePath}: ${decision.choice}`);
+        }
+      },
+      onComplete: (decisions: Map<string, Decision>) => {
+        finalDecisions = decisions;
+      },
+      verbose: args.verbose,
+    })
+  );
+
+  // Wait for UI to finish
+  await waitUntilExit();
+
+  // Cleanup
+  if (args.cleanup) {
+    console.log('🧹 Cleaning up worktrees...');
+    await orchestrator.cleanup();
+  } else {
+    console.log('📁 Worktrees preserved (--no-cleanup)');
+    const worktrees = orchestrator.getWorktreeManager().getTrackedWorktrees();
+    for (const wt of worktrees) {
+      console.log(`   ${wt.path}`);
+    }
   }
 
+  // Output decision summary if any were made
+  if (finalDecisions.size > 0) {
+    console.log('\n📝 Decisions made:');
+    for (const [file, decision] of finalDecisions) {
+      console.log(`   ${file}: ${decision.choice}${decision.agentName ? ` (${decision.agentName})` : ''}`);
+    }
+  }
+
+  console.log('\n✨ Done!');
+}
+
+/**
+ * Run in batch mode (original behavior, no interactive UI)
+ */
+async function runBatch(args: CliArgs): Promise<void> {
   // Check synthesis availability
   const synthAvailable = await Synthesizer.isAvailable(args.synthesizer);
   
@@ -440,6 +527,34 @@ async function main(): Promise<void> {
     }
     
     process.exit(1);
+  }
+}
+
+async function main(): Promise<void> {
+  const args = await parseArgs();
+
+  // Handle --list-models
+  if (args.listModels) {
+    await listModels();
+    return;
+  }
+
+  // Handle --init
+  if (args.initConfig) {
+    await initConfigFile();
+    return;
+  }
+
+  // Check if TTY is available for interactive mode
+  const isTTY = process.stdin.isTTY && process.stdout.isTTY;
+  
+  if (args.interactive && isTTY) {
+    await runInteractive(args);
+  } else {
+    if (args.interactive && !isTTY) {
+      console.log('Note: Interactive mode not available (not a TTY). Running in batch mode.');
+    }
+    await runBatch(args);
   }
 }
 
