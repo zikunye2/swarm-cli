@@ -13,4 +13,5 @@ export {
   readGeminiCredentials,
   isExpired,
   getAccessToken,
+  validateCredentials,
 } from './credentials.js';

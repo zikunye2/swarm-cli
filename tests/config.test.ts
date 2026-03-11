@@ -4,7 +4,7 @@
 
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
-import { validateModelSpec, validateConfig } from '../src/config.js';
+import { validateModelSpec, validateConfig, isConfigComplete } from '../src/config.js';
 
 describe('validateModelSpec', () => {
   test('accepts valid provider', () => {
@@ -98,5 +98,43 @@ describe('validateConfig', () => {
   test('accepts empty config', () => {
     const result = validateConfig({});
     assert.strictEqual(result.valid, true);
+  });
+});
+
+describe('isConfigComplete', () => {
+  test('returns false when no agents configured', () => {
+    const config = {
+      defaultAgents: [],
+      defaultSynthesizer: 'claude:sonnet',
+      providers: {
+        claude: { auth: 'api' as const, apiKey: 'ANTHROPIC_API_KEY' },
+      },
+    };
+    assert.strictEqual(isConfigComplete(config), false);
+  });
+
+  test('returns false when api key env var not set', () => {
+    const original = process.env.NONEXISTENT_KEY;
+    delete process.env.NONEXISTENT_KEY;
+    const config = {
+      defaultAgents: ['claude'],
+      defaultSynthesizer: 'claude:sonnet',
+      providers: {
+        claude: { auth: 'api' as const, apiKey: 'NONEXISTENT_KEY' },
+      },
+    };
+    assert.strictEqual(isConfigComplete(config), false);
+    if (original !== undefined) process.env.NONEXISTENT_KEY = original;
+  });
+
+  test('returns true for oauth provider', () => {
+    const config = {
+      defaultAgents: ['claude'],
+      defaultSynthesizer: 'claude:sonnet',
+      providers: {
+        claude: { auth: 'oauth' as const },
+      },
+    };
+    assert.strictEqual(isConfigComplete(config), true);
   });
 });

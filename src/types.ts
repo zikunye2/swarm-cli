@@ -93,3 +93,29 @@ export interface CliOptions {
   verbose?: boolean;
   outputFormat?: 'json' | 'text';
 }
+
+// ============================================================================
+// REPL Types
+// ============================================================================
+
+/** REPL lifecycle states */
+export type ReplState = 'setup' | 'idle' | 'confirming' | 'executing' | 'reviewing';
+
+/** Setup wizard step progression */
+export type SetupStep = 'welcome' | 'providers' | 'auth' | 'validate' | 'done';
+
+/** Status info for a single provider */
+export interface ProviderStatus {
+  name: string;
+  displayName: string;
+  available: boolean;
+  authType: string;
+  authValid: boolean;
+  variants: string[];
+}
+
+/** Result of detecting all available agents */
+export interface DetectedAgents {
+  available: ProviderStatus[];
+  unavailable: ProviderStatus[];
+}

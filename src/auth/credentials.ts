@@ -414,3 +414,63 @@ export function isExpired(creds: Credentials): boolean {
 export function getAccessToken(creds: Credentials): string {
   return creds.type === 'oauth' ? creds.access : creds.token;
 }
+
+// ============================================================================
+// Credential Validation
+// ============================================================================
+
+/**
+ * Validate credentials for a given provider and auth type.
+ * Returns whether credentials are present and valid.
+ */
+export async function validateCredentials(
+  provider: string,
+  authType: string,
+): Promise<{ valid: boolean; error?: string }> {
+  if (authType === 'api') {
+    const envVarMap: Record<string, string> = {
+      claude: 'ANTHROPIC_API_KEY',
+      openai: 'OPENAI_API_KEY',
+      codex: 'OPENAI_API_KEY',
+      gemini: 'GEMINI_API_KEY',
+    };
+
+    const envVar = envVarMap[provider];
+    if (!envVar) {
+      return { valid: false, error: `Unknown provider: ${provider}` };
+    }
+
+    if (!process.env[envVar]) {
+      return { valid: false, error: `Environment variable ${envVar} is not set` };
+    }
+
+    return { valid: true };
+  }
+
+  if (authType === 'oauth') {
+    const readerMap: Record<string, () => Credentials | null> = {
+      claude: readClaudeCredentials,
+      openai: readCodexCredentials,
+      codex: readCodexCredentials,
+      gemini: readGeminiCredentials,
+    };
+
+    const reader = readerMap[provider];
+    if (!reader) {
+      return { valid: false, error: `Unknown provider: ${provider}` };
+    }
+
+    const creds = reader();
+    if (!creds) {
+      return { valid: false, error: `No OAuth credentials found for ${provider}` };
+    }
+
+    if (isExpired(creds)) {
+      return { valid: false, error: `OAuth token for ${provider} has expired` };
+    }
+
+    return { valid: true };
+  }
+
+  return { valid: false, error: `Unknown auth type: ${authType}` };
+}

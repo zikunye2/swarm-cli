@@ -23,6 +23,7 @@ export interface AppProps {
   onSynthesize: (results: AgentResult[]) => Promise<SynthesisResult>;
   onDecision?: (conflict: FileConflict, decision: Decision) => Promise<void>;
   onComplete?: (decisions: Map<string, Decision>) => void;
+  onExit?: () => void;
   verbose?: boolean;
 }
 
@@ -33,9 +34,11 @@ export function App({
   onSynthesize,
   onDecision,
   onComplete,
+  onExit,
   verbose = false,
 }: AppProps) {
-  const { exit } = useApp();
+  const { exit: inkExit } = useApp();
+  const exit = onExit || inkExit;
   
   // Phase management
   const [phase, setPhase] = useState<AppPhase>('agents');

@@ -184,6 +184,46 @@ export function validateModelSpec(spec: string): { valid: boolean; error?: strin
 }
 
 /**
+ * Check if config file exists on disk
+ */
+export function configExists(): boolean {
+  return existsSync(CONFIG_FILE);
+}
+
+/**
+ * Check if config has at least one provider with valid auth
+ */
+export function isConfigComplete(config: SwarmConfig): boolean {
+  if (!config.defaultAgents || config.defaultAgents.length === 0) {
+    return false;
+  }
+
+  const hasProvider = Object.entries(config.providers).some(([, p]) => {
+    if (p.auth === 'api' && p.apiKey) {
+      return !!process.env[p.apiKey];
+    }
+    return p.auth === 'oauth' || p.auth === 'cli';
+  });
+
+  return hasProvider;
+}
+
+/**
+ * Update a single provider's config (load, merge, save)
+ */
+export async function updateProviderConfig(
+  providerName: string,
+  update: Partial<ProviderConfig>,
+): Promise<void> {
+  const config = await loadConfig();
+  config.providers[providerName] = {
+    ...config.providers[providerName],
+    ...update,
+  };
+  await saveConfig(config);
+}
+
+/**
  * Validate entire config structure
  */
 export function validateConfig(config: unknown): { valid: boolean; errors: string[] } {

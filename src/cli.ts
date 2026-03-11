@@ -22,6 +22,8 @@ import { ProviderRegistry, listAllModels } from './models/index.js';
 import { App, Decision } from './ui/index.js';
 import { writeSwarmLog, SwarmLogEntry, DecisionEntry, createCommitMessage } from './logging.js';
 import { Applier } from './applier.js';
+import { printSplash } from './splash.js';
+import { Repl } from './repl/index.js';
 import path from 'node:path';
 
 interface CliArgs {
@@ -35,8 +37,9 @@ interface CliArgs {
   listModels: boolean;
   initConfig: boolean;
   interactive: boolean;
-  apply: boolean;       // Auto-apply chosen changes
-  logToFile: boolean;   // Write to SWARM_LOG.md
+  replMode: boolean;     // No-args → enter REPL
+  apply: boolean;        // Auto-apply chosen changes
+  logToFile: boolean;    // Write to SWARM_LOG.md
 }
 
 // Track orchestrator globally for cleanup on signals
@@ -74,9 +77,28 @@ process.on('SIGTERM', () => handleShutdown('SIGTERM'));
 async function parseArgs(): Promise<CliArgs> {
   const args = process.argv.slice(2);
   
-  if (args.length === 0 || args.includes('--help') || args.includes('-h')) {
+  if (args.includes('--help') || args.includes('-h')) {
     printHelp();
     process.exit(0);
+  }
+
+  // No arguments → REPL mode
+  if (args.length === 0) {
+    return {
+      task: '',
+      agents: [],
+      synthesizer: '',
+      repoPath: process.cwd(),
+      verbose: false,
+      outputFormat: 'text',
+      cleanup: true,
+      listModels: false,
+      initConfig: false,
+      interactive: true,
+      replMode: true,
+      apply: false,
+      logToFile: true,
+    };
   }
 
   if (args.includes('--version')) {
@@ -97,6 +119,7 @@ async function parseArgs(): Promise<CliArgs> {
       listModels: true,
       initConfig: false,
       interactive: false,
+      replMode: false,
       apply: false,
       logToFile: true,
     };
@@ -114,6 +137,7 @@ async function parseArgs(): Promise<CliArgs> {
       listModels: false,
       initConfig: true,
       interactive: false,
+      replMode: false,
       apply: false,
       logToFile: true,
     };
@@ -133,6 +157,7 @@ async function parseArgs(): Promise<CliArgs> {
     listModels: false,
     initConfig: false,
     interactive: true,
+    replMode: false,
     apply: false,
     logToFile: true,
   };
@@ -218,10 +243,11 @@ function printHelp(): void {
   console.log(`
 swarm - Multi-Agent Deliberation CLI
 
-Usage: swarm "<task>" [options]
+Usage: swarm                         Start interactive REPL
+       swarm "<task>" [options]      Run a single task
 
 Arguments:
-  task                       The coding task to execute (required, in quotes)
+  task                       The coding task to execute (in quotes)
 
 Options:
   -a, --agents <list>        Comma-separated list of agents/models
@@ -461,7 +487,9 @@ function formatTextOutput(synthesis: SynthesisResult): string {
  */
 async function runInteractive(args: CliArgs): Promise<void> {
   const startTime = Date.now();
-  
+
+  printSplash('0.1.0');
+
   const orchestrator = new Orchestrator({
     repoPath: args.repoPath,
     verbose: args.verbose,
@@ -639,7 +667,7 @@ async function runBatch(args: CliArgs): Promise<void> {
     process.exit(1);
   }
 
-  console.log(`\n🐝 SWARM starting...`);
+  printSplash('0.1.0');
   console.log(`Task: "${args.task}"`);
   console.log(`Agents: ${args.agents.join(', ')}`);
   console.log(`Synthesizer: ${args.synthesizer}`);
@@ -784,6 +812,25 @@ async function runBatch(args: CliArgs): Promise<void> {
   globalOrchestrator = null;
 }
 
+/**
+ * Run in REPL mode — interactive prompt loop
+ */
+async function runRepl(args: CliArgs): Promise<void> {
+  const isTTY = process.stdin.isTTY && process.stdout.isTTY;
+  if (!isTTY) {
+    console.error('REPL mode requires an interactive terminal.');
+    process.exit(1);
+  }
+
+  printSplash('0.1.0');
+
+  const { waitUntilExit } = render(
+    React.createElement(Repl, { verbose: args.verbose }),
+  );
+
+  await waitUntilExit();
+}
+
 async function main(): Promise<void> {
   try {
     const args = await parseArgs();
@@ -800,9 +847,15 @@ async function main(): Promise<void> {
       return;
     }
 
+    // REPL mode (no args)
+    if (args.replMode) {
+      await runRepl(args);
+      return;
+    }
+
     // Check if TTY is available for interactive mode
     const isTTY = process.stdin.isTTY && process.stdout.isTTY;
-    
+
     if (args.interactive && isTTY) {
       await runInteractive(args);
     } else {
